@@ -17,6 +17,7 @@ use crate::auth::{check_key_valid, get_condition_values_with_query, get_session_
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
+use crate::storage::request_context::RequestContext;
 use metrics::counter;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
@@ -45,6 +46,7 @@ pub(crate) struct ReqInfo {
     pub version_id: Option<String>,
     #[allow(dead_code)]
     pub region: Option<s3s::region::Region>,
+    pub request_context: Option<RequestContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +67,15 @@ pub(crate) fn req_info_mut<T>(req: &mut S3Request<T>) -> S3Result<&mut ReqInfo> 
 fn ext_req_info_mut(ext: &mut http::Extensions) -> S3Result<&mut ReqInfo> {
     ext.get_mut::<ReqInfo>()
         .ok_or_else(|| s3_error!(InternalError, "ReqInfo not found in request extensions"))
+}
+
+/// Extract the canonical `RequestContext` from a request, checking both
+/// the request extensions directly and the `ReqInfo.request_context` field.
+pub(crate) fn request_context_from_req<T>(req: &S3Request<T>) -> Option<RequestContext> {
+    req.extensions
+        .get::<RequestContext>()
+        .cloned()
+        .or_else(|| req.extensions.get::<ReqInfo>().and_then(|ri| ri.request_context.clone()))
 }
 
 #[derive(Clone, Debug)]
@@ -731,10 +742,13 @@ impl S3Access for FS {
             (None, false)
         };
 
+        let request_context = cx.extensions_mut().get::<RequestContext>().cloned();
+
         let req_info = ReqInfo {
             cred,
             is_owner,
             region: rustfs_ecstore::global::get_global_region(),
+            request_context,
             ..Default::default()
         };
 
@@ -1449,6 +1463,12 @@ impl S3Access for FS {
         authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
     }
 
+    async fn list_object_versions_m(&self, req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
+    }
+
     /// Checks whether the ListObjects request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
@@ -1463,6 +1483,13 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
+    }
+
+    async fn list_objects_v2m(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
