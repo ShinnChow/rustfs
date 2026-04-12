@@ -136,7 +136,7 @@ Similarly, you can run the command with podman
 podman compose --profile observability up -d
 ```
 
-**NOTE**: We recommend reviewing the `docker-compose.yaml` file before running. It defines several services including Grafana, Prometheus, and Jaeger, which are helpful for RustFS observability. If you wish to start Redis or Nginx containers, you can specify the corresponding profiles.
+**NOTE**: We recommend reviewing the `docker-compose.yml` file before running. It defines several services including Grafana, Prometheus, and Jaeger, which are helpful for RustFS observability. If you wish to start Redis or Nginx containers, you can specify the corresponding profiles.
 
 ### 3\. Build from Source (Option 3) - Advanced Users
 
@@ -193,6 +193,19 @@ nix build github:rustfs/rustfs
 # Or from a local checkout
 nix build
 nix run
+```
+
+### 6\. X-CMD (Option 6)
+
+If you are an [x-cmd](https://www.x-cmd.com/install/rustfs) user:
+
+```bash
+# Run directly without installing
+x rustfs
+
+# Download the binary and install it to the global environment
+x env use rustfs
+rustfs --help
 ```
 
 ---
