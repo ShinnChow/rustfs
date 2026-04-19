@@ -13,22 +13,139 @@
 // limitations under the License.
 
 use crate::admin::console::is_console_path;
+use crate::error::ApiError;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX};
 use crate::storage::apply_cors_headers;
+use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use opentelemetry::global;
+use opentelemetry::trace::TraceContextExt;
 use rustfs_utils::get_env_opt_str;
+use rustfs_utils::http::headers::AMZ_REQUEST_ID;
+use s3s::S3ErrorCode;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tower::{Layer, Service};
 use tracing::debug;
+
+/// A carrier that adapts [`HeaderMap`] for OpenTelemetry trace context propagation.
+struct HeaderMapCarrier<'a>(&'a HeaderMap);
+
+impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+
+    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
+        let headers = self
+            .0
+            .get_all(key)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+
+        if headers.is_empty() { None } else { Some(headers) }
+    }
+}
+
+/// Tower middleware layer that creates a canonical [`RequestContext`] from HTTP headers
+/// and injects it into `request.extensions()`.
+///
+/// This layer must be placed after `SetRequestIdLayer` in the middleware stack,
+/// as it reads the `x-request-id` header that `SetRequestIdLayer` generates.
+///
+/// Additionally, it sets the `x-amz-request-id` request header for S3 compatibility
+/// if not already present.
+#[derive(Clone, Default)]
+pub struct RequestContextLayer;
+
+impl<S> Layer<S> for RequestContextLayer {
+    type Service = RequestContextService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestContextService { inner }
+    }
+}
+
+/// Service that injects [`RequestContext`] into every request.
+#[derive(Clone)]
+pub struct RequestContextService<S> {
+    inner: S,
+}
+
+impl<S, B> Service<HttpRequest<B>> for RequestContextService<S>
+where
+    S: Service<HttpRequest<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
+        let request_id = extract_request_id_from_headers(req.headers());
+
+        // Extract OpenTelemetry trace/span context from incoming headers
+        let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier(req.headers())));
+        let span_ref = parent_cx.span();
+        let span_context = span_ref.span_context();
+        let trace_id = if span_context.is_valid() {
+            Some(span_context.trace_id().to_string())
+        } else {
+            None
+        };
+        let span_id = if span_context.is_valid() {
+            Some(span_context.span_id().to_string())
+        } else {
+            None
+        };
+
+        // Preserve the upstream x-amz-request-id if present (S3 client forwarding),
+        // otherwise fall back to the canonical request_id.
+        let x_amz_request_id = req
+            .headers()
+            .get(AMZ_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .unwrap_or_else(|| request_id.clone());
+
+        let ctx = RequestContext {
+            request_id: request_id.clone(),
+            x_amz_request_id,
+            trace_id,
+            span_id,
+            start_time: Instant::now(),
+        };
+
+        req.extensions_mut().insert(ctx);
+
+        // Set x-amz-request-id for S3 compatibility downstream
+        if !req.headers().contains_key(AMZ_REQUEST_ID)
+            && let Ok(val) = HeaderValue::from_str(&request_id)
+        {
+            req.headers_mut()
+                .insert(http::header::HeaderName::from_static(AMZ_REQUEST_ID), val);
+        }
+
+        self.inner.call(req)
+    }
+}
 
 /// Redirect layer that redirects browser requests to the console
 #[derive(Clone)]
@@ -158,6 +275,68 @@ fn is_empty_body_admin_put_path(path: &str) -> bool {
 }
 
 #[derive(Clone)]
+pub struct S3ErrorMessageCompatLayer;
+
+impl<S> Layer<S> for S3ErrorMessageCompatLayer {
+    type Service = S3ErrorMessageCompatService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        S3ErrorMessageCompatService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct S3ErrorMessageCompatService<S> {
+    inner: S,
+}
+
+impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for S3ErrorMessageCompatService<S>
+where
+    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
+    RestBody::Error: Into<S::Error> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let response = inner.call(req).await?;
+            let (parts, body) = response.into_parts();
+            let should_fix = parts.status == StatusCode::FORBIDDEN && is_xml_response(&parts.headers);
+
+            let response = match body {
+                HybridBody::Rest { rest_body } => {
+                    if !should_fix {
+                        Response::from_parts(parts, HybridBody::Rest { rest_body })
+                    } else {
+                        let (rest_body, changed) = fix_s3_error_message_in_xml(rest_body).await.map_err(Into::into)?;
+                        let mut parts = parts;
+                        if changed {
+                            parts.headers.remove(http::header::CONTENT_LENGTH);
+                        }
+                        Response::from_parts(parts, HybridBody::Rest { rest_body })
+                    }
+                }
+                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+            };
+
+            Ok(response)
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct ObjectAttributesEtagFixLayer;
 
 impl<S> Layer<S> for ObjectAttributesEtagFixLayer {
@@ -247,6 +426,30 @@ where
     let xml = String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
     let fixed = strip_quotes_from_first_etag(xml);
     Ok(RestBody::from(Bytes::from(fixed)))
+}
+
+async fn fix_s3_error_message_in_xml<RestBody>(body: RestBody) -> Result<(RestBody, bool), RestBody::Error>
+where
+    RestBody: Body<Data = Bytes> + From<Bytes>,
+{
+    let bytes = BodyExt::collect(body).await?.to_bytes();
+    let xml = String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+    let (fixed, changed) = insert_missing_signature_error_message(xml);
+    Ok((RestBody::from(Bytes::from(fixed)), changed))
+}
+
+fn insert_missing_signature_error_message(mut xml: String) -> (String, bool) {
+    if !xml.contains("<Code>SignatureDoesNotMatch</Code>") || xml.contains("<Message>") {
+        return (xml, false);
+    }
+
+    let Some(code_end) = xml.find("</Code>") else {
+        return (xml, false);
+    };
+
+    let message = ApiError::error_code_to_message(&S3ErrorCode::SignatureDoesNotMatch);
+    xml.insert_str(code_end + "</Code>".len(), &format!("<Message>{message}</Message>"));
+    (xml, true)
 }
 
 fn strip_quotes_from_first_etag(xml: String) -> String {
@@ -339,8 +542,11 @@ impl ConditionalCorsLayer {
         let allowed_origin = match (origin, &self.cors_origins) {
             (Some(orig), Some(config)) if config == "*" => Some(orig),
             (Some(orig), Some(config)) => {
-                let origins: Vec<&str> = config.split(',').map(|s| s.trim()).collect();
-                if origins.contains(&orig.as_str()) { Some(orig) } else { None }
+                if config.split(',').map(|s| s.trim()).any(|x| x == orig.as_str()) {
+                    Some(orig)
+                } else {
+                    None
+                }
             }
             (Some(orig), None) => Some(orig), // Default: allow all if not configured
             _ => None,
@@ -563,10 +769,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::{Ready, ready};
     use http::Request;
     use http_body_util::BodyExt;
     use http_body_util::Full;
+    use std::convert::Infallible;
     use temp_env::with_var;
+
+    #[derive(Clone, Debug)]
+    struct CaptureService;
+
+    impl<B> Service<Request<B>> for CaptureService {
+        type Response = Request<B>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<B>) -> Self::Future {
+            ready(Ok(req))
+        }
+    }
 
     #[test]
     fn admin_chunked_put_without_content_length_is_normalized() {
@@ -647,6 +872,24 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_missing_signature_error_message() {
+        let (fixed, changed) =
+            insert_missing_signature_error_message("<Error><Code>SignatureDoesNotMatch</Code></Error>".to_string());
+
+        assert!(changed);
+        assert!(fixed.contains("<Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided."));
+    }
+
+    #[test]
+    fn test_insert_missing_signature_error_message_preserves_existing_message() {
+        let input = "<Error><Code>SignatureDoesNotMatch</Code><Message>custom</Message></Error>".to_string();
+        let (fixed, changed) = insert_missing_signature_error_message(input.clone());
+
+        assert!(!changed);
+        assert_eq!(fixed, input);
+    }
+
+    #[test]
     fn test_is_s3_path_excludes_admin_and_special_paths() {
         assert!(ConditionalCorsLayer::is_s3_path("/my-bucket/key"));
         assert!(ConditionalCorsLayer::is_s3_path("/"));
@@ -699,6 +942,49 @@ mod tests {
             let cors = ConditionalCorsLayer::new();
             assert_eq!(cors.cors_origins.as_deref(), Some("https://allowed.com"));
         });
+    }
+
+    #[test]
+    fn request_context_layer_populates_context_and_s3_request_id_from_x_request_id() {
+        let mut service = RequestContextLayer.layer(CaptureService);
+        let request = Request::builder()
+            .uri("/bucket/object")
+            .header("x-request-id", "req-123")
+            .body(())
+            .expect("request");
+
+        let request = service.call(request).into_inner().expect("service call should succeed");
+        let context = request
+            .extensions()
+            .get::<RequestContext>()
+            .expect("request context should be present");
+
+        assert_eq!(context.request_id, "req-123");
+        assert_eq!(context.x_amz_request_id, "req-123");
+        assert!(context.trace_id.is_none());
+        assert!(context.span_id.is_none());
+        assert_eq!(request.headers().get(AMZ_REQUEST_ID).unwrap(), "req-123");
+    }
+
+    #[test]
+    fn request_context_layer_preserves_upstream_s3_request_id() {
+        let mut service = RequestContextLayer.layer(CaptureService);
+        let request = Request::builder()
+            .uri("/bucket/object")
+            .header("x-request-id", "req-123")
+            .header(AMZ_REQUEST_ID, "amz-456")
+            .body(())
+            .expect("request");
+
+        let request = service.call(request).into_inner().expect("service call should succeed");
+        let context = request
+            .extensions()
+            .get::<RequestContext>()
+            .expect("request context should be present");
+
+        assert_eq!(context.request_id, "req-123");
+        assert_eq!(context.x_amz_request_id, "amz-456");
+        assert_eq!(request.headers().get(AMZ_REQUEST_ID).unwrap(), "amz-456");
     }
 
     #[tokio::test]

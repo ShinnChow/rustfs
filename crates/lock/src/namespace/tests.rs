@@ -13,11 +13,99 @@
 // limitations under the License.
 
 use super::*;
-use crate::GlobalLockManager;
 use crate::client::{ClientFactory, local::LocalClient};
 use crate::types::LockType;
+use crate::{GlobalLockManager, LockError, LockInfo, LockResponse, LockStats};
 use std::sync::Arc;
 use std::time::Duration;
+
+#[derive(Debug, Default)]
+struct FailingClient;
+
+#[async_trait::async_trait]
+impl crate::client::LockClient for FailingClient {
+    async fn acquire_lock(&self, _request: &LockRequest) -> crate::Result<LockResponse> {
+        Err(LockError::internal("simulated offline client"))
+    }
+
+    async fn release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn force_release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+        Ok(None)
+    }
+
+    async fn get_stats(&self) -> crate::Result<LockStats> {
+        Ok(LockStats::default())
+    }
+
+    async fn close(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    async fn is_online(&self) -> bool {
+        false
+    }
+
+    async fn is_local(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
+struct DelayedClient {
+    inner: Arc<dyn crate::client::LockClient>,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl crate::client::LockClient for DelayedClient {
+    async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.acquire_lock(request).await
+    }
+
+    async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.release(lock_id).await
+    }
+
+    async fn refresh(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.refresh(lock_id).await
+    }
+
+    async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.force_release(lock_id).await
+    }
+
+    async fn check_status(&self, lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+        self.inner.check_status(lock_id).await
+    }
+
+    async fn get_stats(&self) -> crate::Result<LockStats> {
+        self.inner.get_stats().await
+    }
+
+    async fn close(&self) -> crate::Result<()> {
+        self.inner.close().await
+    }
+
+    async fn is_online(&self) -> bool {
+        self.inner.is_online().await
+    }
+
+    async fn is_local(&self) -> bool {
+        self.inner.is_local().await
+    }
+}
 
 fn create_test_object_key(bucket: &str, object: &str) -> ObjectKey {
     ObjectKey {
@@ -53,6 +141,37 @@ async fn test_namespace_lock_with_clients() {
     let clients = vec![ClientFactory::create_local(), ClientFactory::create_local()];
     let lock = NamespaceLock::with_clients("multi-client".to_string(), clients);
     assert_eq!(lock.namespace(), "multi-client");
+}
+
+#[tokio::test]
+async fn test_lock_client_default_batch_acquire_and_release() {
+    let manager = Arc::new(GlobalLockManager::new());
+    let client = LocalClient::with_manager(manager);
+    let requests = vec![
+        LockRequest::new(create_test_object_key("bucket", "object-a"), LockType::Exclusive, "owner-a")
+            .with_acquire_timeout(Duration::from_secs(1)),
+        LockRequest::new(create_test_object_key("bucket", "object-b"), LockType::Exclusive, "owner-a")
+            .with_acquire_timeout(Duration::from_secs(1)),
+    ];
+
+    let responses = client.acquire_locks_batch(&requests).await.unwrap();
+    assert_eq!(responses.len(), requests.len());
+    assert!(responses.iter().all(|response| response.success));
+
+    let lock_ids = responses
+        .iter()
+        .map(|response| {
+            response
+                .lock_info
+                .as_ref()
+                .expect("successful batch acquire should return lock info")
+                .id
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    let released = client.release_locks_batch(&lock_ids).await.unwrap();
+
+    assert_eq!(released, vec![true, true]);
 }
 
 #[tokio::test]
@@ -367,4 +486,220 @@ async fn test_namespace_lock_distributed_with_clients_and_quorum() {
     assert_eq!(health.status, crate::types::HealthStatus::Healthy);
 
     drop(guard_b);
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_read_lock_succeeds_with_two_nodes_one_offline() {
+    let manager = Arc::new(GlobalLockManager::new());
+    let client_ok: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+    let client_offline: Arc<dyn LockClient> = Arc::new(FailingClient);
+
+    let lock = NamespaceLock::with_clients_and_quorum("two-node".to_string(), vec![client_ok, client_offline], 2);
+    let resource = create_test_object_key("bucket", "object");
+
+    let guard = lock
+        .get_read_lock(resource, "owner-a", Duration::from_millis(100))
+        .await
+        .expect("read lock should succeed with one healthy node in a two-node cluster");
+
+    match guard {
+        NamespaceLockGuard::Standard(_) => {}
+        NamespaceLockGuard::Fast(_) => panic!("Expected Standard guard for distributed lock"),
+    }
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_write_lock_fails_with_two_nodes_one_offline() {
+    let manager = Arc::new(GlobalLockManager::new());
+    let client_ok: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+    let client_offline: Arc<dyn LockClient> = Arc::new(FailingClient);
+
+    let lock = NamespaceLock::with_clients_and_quorum("two-node".to_string(), vec![client_ok, client_offline], 2);
+    let resource = create_test_object_key("bucket", "object");
+
+    let err = lock
+        .get_write_lock(resource, "owner-a", Duration::from_millis(100))
+        .await
+        .expect_err("write lock should fail with one healthy node in a two-node cluster");
+
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "expected quorum error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_quorum_failure_rolls_back_successful_nodes() {
+    let manager1 = Arc::new(GlobalLockManager::new());
+    let manager2 = Arc::new(GlobalLockManager::new());
+
+    let client1: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager1.clone()));
+    let client2: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager2.clone()));
+    let client3: Arc<dyn LockClient> = Arc::new(FailingClient);
+
+    let resource = create_test_object_key("bucket", "object");
+
+    let distributed_lock = NamespaceLock::with_clients_and_quorum("three-node".to_string(), vec![client1, client2, client3], 3);
+    let err = distributed_lock
+        .get_write_lock(resource.clone(), "owner-a", Duration::from_millis(100))
+        .await
+        .expect_err("write lock should fail when quorum requires all three nodes");
+
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "expected quorum error, got: {err}"
+    );
+
+    let local_lock_1 = NamespaceLock::with_local_manager("node-1".to_string(), manager1);
+    let local_lock_2 = NamespaceLock::with_local_manager("node-2".to_string(), manager2);
+
+    let guard1 = local_lock_1
+        .get_write_lock(resource.clone(), "owner-b", Duration::from_millis(100))
+        .await
+        .expect("quorum rollback should release node 1");
+    let guard2 = local_lock_2
+        .get_write_lock(resource, "owner-b", Duration::from_millis(100))
+        .await
+        .expect("quorum rollback should release node 2");
+
+    drop(guard1);
+    drop(guard2);
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_even_node_read_write_quorum_split() {
+    let manager1 = Arc::new(GlobalLockManager::new());
+    let manager2 = Arc::new(GlobalLockManager::new());
+
+    let client1: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager1));
+    let client2: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager2));
+    let client3: Arc<dyn LockClient> = Arc::new(FailingClient);
+    let client4: Arc<dyn LockClient> = Arc::new(FailingClient);
+
+    let lock = NamespaceLock::with_clients("four-node".to_string(), vec![client1, client2, client3, client4]);
+    let resource = create_test_object_key("bucket", "object");
+
+    let mut read_guard = lock
+        .get_read_lock(resource.clone(), "owner-a", Duration::from_millis(100))
+        .await
+        .expect("read lock should succeed with two healthy nodes in a four-node cluster");
+
+    match &read_guard {
+        NamespaceLockGuard::Standard(_) => {}
+        NamespaceLockGuard::Fast(_) => panic!("Expected Standard guard for distributed lock"),
+    }
+    assert!(read_guard.release(), "read guard should release cleanly");
+
+    let err = lock
+        .get_write_lock(resource, "owner-a", Duration::from_millis(100))
+        .await
+        .expect_err("write lock should fail because four-node cluster requires quorum of 3");
+
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "expected quorum error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_read_lock_returns_after_quorum_without_waiting_for_slow_clients() {
+    let manager_fast_1 = Arc::new(GlobalLockManager::new());
+    let manager_fast_2 = Arc::new(GlobalLockManager::new());
+    let manager_slow_1 = Arc::new(GlobalLockManager::new());
+    let manager_slow_2 = Arc::new(GlobalLockManager::new());
+
+    let client_fast_1: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager_fast_1));
+    let client_fast_2: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager_fast_2));
+    let client_slow_1: Arc<dyn LockClient> = Arc::new(DelayedClient {
+        inner: Arc::new(LocalClient::with_manager(manager_slow_1.clone())),
+        delay: Duration::from_millis(250),
+    });
+    let client_slow_2: Arc<dyn LockClient> = Arc::new(DelayedClient {
+        inner: Arc::new(LocalClient::with_manager(manager_slow_2.clone())),
+        delay: Duration::from_millis(250),
+    });
+
+    let lock = NamespaceLock::with_clients(
+        "four-node-read".to_string(),
+        vec![client_fast_1, client_fast_2, client_slow_1, client_slow_2],
+    );
+    let resource = create_test_object_key("bucket", "object");
+
+    let started = tokio::time::Instant::now();
+    let mut guard = lock
+        .get_read_lock(resource.clone(), "owner-a", Duration::from_secs(1))
+        .await
+        .expect("read lock should succeed after reaching quorum");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "read lock should return once quorum is satisfied instead of waiting for slow clients"
+    );
+    assert!(guard.release(), "distributed read guard should release successfully");
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let slow_lock_1 = NamespaceLock::with_local_manager("slow-node-1".to_string(), manager_slow_1);
+    let slow_lock_2 = NamespaceLock::with_local_manager("slow-node-2".to_string(), manager_slow_2);
+
+    let write_guard_1 = slow_lock_1
+        .get_write_lock(resource.clone(), "owner-b", Duration::from_millis(100))
+        .await
+        .expect("late successful read lock should be cleaned up on slow node 1");
+    let write_guard_2 = slow_lock_2
+        .get_write_lock(resource, "owner-b", Duration::from_millis(100))
+        .await
+        .expect("late successful read lock should be cleaned up on slow node 2");
+
+    drop(write_guard_1);
+    drop(write_guard_2);
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_failure_returns_early_and_cleans_up_late_successes() {
+    let manager_fast = Arc::new(GlobalLockManager::new());
+    let manager_slow = Arc::new(GlobalLockManager::new());
+
+    let client_fast: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager_fast));
+    let client_fail_1: Arc<dyn LockClient> = Arc::new(FailingClient);
+    let client_fail_2: Arc<dyn LockClient> = Arc::new(FailingClient);
+    let client_slow: Arc<dyn LockClient> = Arc::new(DelayedClient {
+        inner: Arc::new(LocalClient::with_manager(manager_slow.clone())),
+        delay: Duration::from_millis(250),
+    });
+
+    let lock = NamespaceLock::with_clients(
+        "four-node-write".to_string(),
+        vec![client_fast, client_fail_1, client_fail_2, client_slow],
+    );
+    let resource = create_test_object_key("bucket", "object");
+
+    let started = tokio::time::Instant::now();
+    let err = lock
+        .get_write_lock(resource.clone(), "owner-a", Duration::from_secs(1))
+        .await
+        .expect_err("write lock should fail when quorum becomes impossible");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "write lock should fail as soon as quorum becomes impossible"
+    );
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "expected quorum failure, got: {err}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let slow_lock = NamespaceLock::with_local_manager("slow-node".to_string(), manager_slow);
+    let write_guard = slow_lock
+        .get_write_lock(resource, "owner-b", Duration::from_millis(100))
+        .await
+        .expect("late successful write lock should be cleaned up after early quorum failure");
+
+    drop(write_guard);
 }

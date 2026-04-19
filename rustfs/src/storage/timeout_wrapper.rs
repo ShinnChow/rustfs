@@ -34,7 +34,7 @@
 //! - Configurable request-level timeout (default 30 seconds)
 //! - Automatic cancellation of sub-tasks on timeout
 //! - Resource cleanup on timeout (locks, memory, file handles)
-//! - Prometheus metrics for timeout monitoring
+//! - Timeout metrics emitted through `rustfs-io-metrics`
 
 // Allow dead_code for public API that may be used by external modules or future features
 #![allow(dead_code)]
@@ -42,7 +42,7 @@
 //! - Configurable request-level timeout (default 30 seconds)
 //! - Automatic cancellation of sub-tasks on timeout
 //! - Resource cleanup on timeout (locks, memory, file handles)
-//! - Prometheus metrics for timeout monitoring
+//! - Timeout metrics emitted through `rustfs-io-metrics`
 //!
 //! # Usage
 //!
@@ -234,12 +234,15 @@ pub struct RequestTimeoutWrapper {
 
 impl RequestTimeoutWrapper {
     /// Create a new timeout wrapper with the given configuration.
+    ///
+    /// Note: This uses a sentinel request_id. Prefer `with_request_id()` to pass
+    /// the canonical request-id from `RequestContext`.
     pub fn new(config: TimeoutConfig) -> Self {
         Self {
             config,
             start_time: Instant::now(),
             cancel_token: CancellationToken::new(),
-            request_id: format!("req-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            request_id: "no-request-id".to_string(),
         }
     }
 
@@ -253,17 +256,17 @@ impl RequestTimeoutWrapper {
         }
     }
 
-    /// Create a new timeout wrapper with operation size for dynamic timeout calculation
+    /// Create a new timeout wrapper with operation size for dynamic timeout calculation.
+    ///
+    /// Note: This uses a sentinel request_id. Prefer `with_request_id()` to pass
+    /// the canonical request-id from `RequestContext`.
     pub fn with_operation_size(config: TimeoutConfig, operation_size: Option<u64>) -> Self {
-        // Store operation size in config for later use
-        // Note: Currently we don't store the size in the wrapper itself,
-        // but the config can be used to calculate appropriate timeout
-        let _ = operation_size; // Suppress unused warning for now
+        let _ = operation_size;
         Self {
             config,
             start_time: Instant::now(),
             cancel_token: CancellationToken::new(),
-            request_id: format!("req-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            request_id: "no-request-id".to_string(),
         }
     }
 

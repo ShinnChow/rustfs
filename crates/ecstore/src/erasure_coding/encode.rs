@@ -106,7 +106,7 @@ impl<'a> MultiWriter<'a> {
             self.writers.len(),
             self.errs
                 .iter()
-                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
+                .map(|e| e.as_ref().map_or_else(|| "<nil>".to_string(), |e| e.to_string()))
                 .collect::<Vec<_>>()
                 .join(", ")
         )))
@@ -168,7 +168,7 @@ impl<'a> MultiWriter<'a> {
             self.writers.len(),
             self.errs
                 .iter()
-                .map(|e| e.as_ref().map_or("<nil>".to_string(), |e| e.to_string()))
+                .map(|e| e.as_ref().map_or_else(|| "<nil>".to_string(), |e| e.to_string()))
                 .collect::<Vec<_>>()
                 .join(", ")
         )))
@@ -223,11 +223,25 @@ impl Erasure {
 
         let mut writers = MultiWriter::new(writers, quorum);
 
+        let mut write_err = None;
+
         while let Some(block) = rx.recv().await {
             if block.is_empty() {
                 break;
             }
-            writers.write(block).await?;
+            if let Err(err) = writers.write(block).await {
+                write_err = Some(err);
+                break;
+            }
+        }
+
+        if let Some(err) = write_err {
+            task.abort();
+            let _ = task.await;
+            if let Err(shutdown_err) = writers.shutdown().await {
+                error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
+            }
+            return Err(err);
         }
 
         let (reader, total) = task.await??;

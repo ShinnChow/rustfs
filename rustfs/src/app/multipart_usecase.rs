@@ -16,16 +16,18 @@
 
 use crate::app::context::{AppContext, get_global_app_context};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
+use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
-use crate::storage::concurrency::get_concurrency_manager;
-use crate::storage::entity;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
     copy_src_opts, extract_metadata, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
-    parse_copy_source_range, put_opts,
+    parse_copy_source_range, put_opts, validate_archive_content_encoding,
 };
-use crate::storage::s3_api::multipart::build_list_parts_output;
+use crate::storage::s3_api::multipart::{
+    ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
+    parse_list_multipart_uploads_params, parse_list_parts_params,
+};
 use crate::storage::*;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -42,11 +44,11 @@ use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
 use rustfs_ecstore::compress::is_compressible;
 use rustfs_ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::set_disk::{MAX_PARTS_COUNT, is_valid_storage_class};
+use rustfs_ecstore::set_disk::is_valid_storage_class;
 use rustfs_ecstore::store_api::{CompletePart, HTTPRangeSpec, MultipartUploadResult, ObjectIO, ObjectOptions, PutObjReader};
 use rustfs_ecstore::store_api::{MultipartOperations, ObjectOperations};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
-use rustfs_rio::{CompressReader, HashReader, Reader, WarpReader};
+use rustfs_rio::{CompressReader, HashReader};
 use rustfs_s3_common::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -62,11 +64,17 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
-use tracing::{info, instrument, warn};
+use tracing::{instrument, warn};
 use urlencoding::encode;
+use uuid::Uuid;
 
-async fn maybe_enqueue_transition_immediate(obj_info: &rustfs_ecstore::store_api::ObjectInfo, src: LcEventSrc) {
-    enqueue_transition_immediate(obj_info, src).await;
+fn merge_part_encryption_metadata(
+    metadata: &HashMap<String, String>,
+    part_metadata: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = metadata.clone();
+    merged.extend(part_metadata.clone());
+    merged
 }
 
 /// Returns InvalidRange error if CopySourceRange end exceeds the source object size.
@@ -182,10 +190,6 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let AbortMultipartUploadInput {
             bucket, key, upload_id, ..
         } = req.input;
@@ -222,10 +226,6 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let mut helper = OperationHelper::new(
             &req,
             EventName::ObjectCreatedCompleteMultipartUpload,
@@ -284,7 +284,9 @@ impl DefaultMultipartUsecase {
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
-        let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
+        let mut opts = get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
+        let capacity_scope_token = Uuid::new_v4();
+        opts.capacity_scope_token = Some(capacity_scope_token);
 
         let uploaded_parts_vec = multipart_upload
             .parts
@@ -318,30 +320,15 @@ impl DefaultMultipartUsecase {
             }
         }
 
-        // TDD: Get multipart info to extract encryption configuration before completing
-        info!(
-            "TDD: Attempting to get multipart info for bucket={}, key={}, upload_id={}",
-            bucket, key, upload_id
-        );
-
         let multipart_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
             .await
             .map_err(ApiError::from)?;
 
-        info!("TDD: Got multipart info successfully");
-        info!("TDD: Multipart info metadata: {:?}", multipart_info.user_defined);
-
-        // TDD: Extract encryption information from multipart upload metadata
         let server_side_encryption = multipart_info
             .user_defined
             .get("x-amz-server-side-encryption")
             .map(|s| ServerSideEncryption::from(s.clone()));
-        info!(
-            "TDD: Raw encryption from metadata: {:?} -> parsed: {:?}",
-            multipart_info.user_defined.get("x-amz-server-side-encryption"),
-            server_side_encryption
-        );
 
         let ssekms_key_id = match server_side_encryption.as_ref() {
             Some(sse) if sse.as_str() == ServerSideEncryption::AWS_KMS => multipart_info
@@ -351,16 +338,12 @@ impl DefaultMultipartUsecase {
             _ => None,
         };
 
-        info!(
-            "TDD: Extracted encryption info - SSE: {:?}, KMS Key: {:?}",
-            server_side_encryption, ssekms_key_id
-        );
-
         let obj_info = store
             .clone()
-            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, opts)
+            .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
             .await
             .map_err(ApiError::from)?;
+        record_capacity_write(Some(capacity_scope_token)).await;
 
         // check quota after completing multipart upload
         if let Some(metadata_sys) = self.bucket_metadata_sys() {
@@ -392,31 +375,15 @@ impl DefaultMultipartUsecase {
             }
         }
 
-        maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
+        enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
 
-        // Invalidate cache for the completed multipart object
-        let manager = get_concurrency_manager();
-        let mpu_bucket = bucket.clone();
-        let mpu_key = key.clone();
         let raw_mpu_version = obj_info.version_id.map(|v| v.to_string());
         let mpu_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
             raw_mpu_version.clone()
         } else {
             None
         };
-        let mpu_version_clone = mpu_version.clone();
         let mpu_version_for_event = mpu_version.clone();
-        tokio::spawn(async move {
-            manager
-                .invalidate_cache_versioned(&mpu_bucket, &mpu_key, mpu_version_clone.as_deref())
-                .await;
-        });
-
-        info!(
-            "TDD: Creating output with SSE: {:?}, KMS Key: {:?}",
-            server_side_encryption, ssekms_key_id
-        );
-
         let mut checksum_crc32 = input.checksum_crc32;
         let mut checksum_crc32c = input.checksum_crc32c;
         let mut checksum_sha1 = input.checksum_sha1;
@@ -462,26 +429,6 @@ impl DefaultMultipartUsecase {
             version_id: mpu_version,
             ..Default::default()
         };
-        let helper_output = entity::CompleteMultipartUploadOutput {
-            bucket: Some(bucket.clone()),
-            key: Some(key.clone()),
-            e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
-            location: Some(location),
-            server_side_encryption,
-            ssekms_key_id,
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_sha1,
-            checksum_sha256,
-            checksum_crc64nvme,
-            checksum_type,
-            ..Default::default()
-        };
-        info!(
-            "TDD: Created output: SSE={:?}, KMS={:?}",
-            output.server_side_encryption, output.ssekms_key_id
-        );
-
         let mt2 = HashMap::new();
         let replicate_options =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
@@ -492,10 +439,6 @@ impl DefaultMultipartUsecase {
             warn!("need multipart replication");
             schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
         }
-        info!(
-            "TDD: About to return S3Response with output: SSE={:?}, KMS={:?}",
-            output.server_side_encryption, output.ssekms_key_id
-        );
 
         // Set object info for event notification
         helper = helper.object(obj_info);
@@ -503,9 +446,9 @@ impl DefaultMultipartUsecase {
             helper = helper.version_id(version_id.clone());
         }
 
-        let helper_result = Ok(S3Response::new(helper_output));
-        let _ = helper.complete(&helper_result);
-        Ok(S3Response::new(output))
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -513,11 +456,9 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
-        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::CreateMultipartUpload);
+        let helper =
+            OperationHelper::new(&req, EventName::ObjectCreatedCreateMultipartUpload, S3Operation::CreateMultipartUpload)
+                .suppress_event();
         let CreateMultipartUploadInput {
             bucket,
             key,
@@ -552,6 +493,12 @@ impl DefaultMultipartUsecase {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        validate_archive_content_encoding(
+            &key,
+            req.headers.get("content-type").and_then(|value| value.to_str().ok()),
+            req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
+        )?;
 
         let mut metadata = extract_metadata(&req.headers);
 
@@ -653,10 +600,6 @@ impl DefaultMultipartUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let input = req.input;
         let UploadPartInput {
             body,
@@ -710,7 +653,7 @@ impl DefaultMultipartUsecase {
         };
 
         let opts = ObjectOptions::default();
-        let mut fi = store
+        let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(ApiError::from)?;
@@ -728,8 +671,6 @@ impl DefaultMultipartUsecase {
 
         let is_compressible = rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
-
         let actual_size = size;
 
         let mut md5hex = if let Some(base64_md5) = input.content_md5 {
@@ -743,21 +684,27 @@ impl DefaultMultipartUsecase {
 
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
-        if is_compressible {
-            let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+        let mut reader = if is_compressible {
+            let mut hrd = HashReader::from_stream(body, size, actual_size, md5hex.take(), sha256hex.take(), false)
+                .map_err(ApiError::from)?;
 
             if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
 
-            let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
-            reader = Box::new(compress_reader);
             size = HashReader::SIZE_PRESERVE_LAYER;
-            md5hex = None;
-            sha256hex = None;
-        }
-
-        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+            HashReader::from_reader(
+                CompressReader::new(hrd, CompressionAlgorithm::default()),
+                size,
+                actual_size,
+                None,
+                None,
+                false,
+            )
+            .map_err(ApiError::from)?
+        } else {
+            HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+        };
 
         if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
             return Err(ApiError::from(err).into());
@@ -811,10 +758,9 @@ impl DefaultMultipartUsecase {
                 let requested_kms_key_id = material.kms_key_id.clone();
 
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
-
-                fi.user_defined.extend(material.metadata);
+                reader =
+                    HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                        .map_err(ApiError::from)?;
 
                 (requested_sse, requested_kms_key_id)
             }
@@ -882,10 +828,6 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let ListMultipartUploadsInput {
             bucket,
             prefix,
@@ -896,62 +838,25 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
+        let ListMultipartUploadsParams {
+            prefix,
+            key_marker,
+            max_uploads,
+        } = parse_list_multipart_uploads_params(prefix, key_marker, max_uploads)?;
+
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-
-        let prefix = prefix.unwrap_or_default();
-        let max_uploads = max_uploads.map(|x| x as usize).unwrap_or(MAX_PARTS_COUNT);
-
-        if let Some(key_marker) = &key_marker
-            && !key_marker.starts_with(prefix.as_str())
-        {
-            return Err(s3_error!(NotImplemented, "Invalid key marker"));
-        }
 
         let result = store
             .list_multipart_uploads(&bucket, &prefix, delimiter, key_marker, upload_id_marker, max_uploads)
             .await
             .map_err(ApiError::from)?;
 
-        let output = ListMultipartUploadsOutput {
-            bucket: Some(bucket),
-            prefix: Some(prefix),
-            delimiter: result.delimiter,
-            key_marker: result.key_marker,
-            upload_id_marker: result.upload_id_marker,
-            max_uploads: Some(result.max_uploads as i32),
-            is_truncated: Some(result.is_truncated),
-            uploads: Some(
-                result
-                    .uploads
-                    .into_iter()
-                    .map(|u| MultipartUpload {
-                        key: Some(u.object),
-                        upload_id: Some(u.upload_id),
-                        initiated: u.initiated.map(Timestamp::from),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            common_prefixes: Some(
-                result
-                    .common_prefixes
-                    .into_iter()
-                    .map(|c| CommonPrefix { prefix: Some(c) })
-                    .collect(),
-            ),
-            ..Default::default()
-        };
-
-        Ok(S3Response::new(output))
+        Ok(S3Response::new(build_list_multipart_uploads_output(bucket, prefix, result)))
     }
 
     pub async fn execute_list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let ListPartsInput {
             bucket,
             key,
@@ -961,23 +866,21 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
+        let params = parse_list_parts_params(part_number_marker, max_parts)?;
+
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let part_number_marker = part_number_marker.map(|x| x as usize);
-        let max_parts = match max_parts {
-            Some(parts) => {
-                if !(1..=1000).contains(&parts) {
-                    return Err(s3_error!(InvalidArgument, "max-parts must be between 1 and 1000"));
-                }
-                parts as usize
-            }
-            None => 1000,
-        };
-
         let res = store
-            .list_object_parts(&bucket, &key, &upload_id, part_number_marker, max_parts, &ObjectOptions::default())
+            .list_object_parts(
+                &bucket,
+                &key,
+                &upload_id,
+                params.part_number_marker,
+                params.max_parts,
+                &ObjectOptions::default(),
+            )
             .await
             .map_err(ApiError::from)?;
 
@@ -989,10 +892,6 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let UploadPartCopyInput {
             bucket,
             key,
@@ -1032,7 +931,7 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut mp_info = store
+        let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
             .await
             .map_err(ApiError::from)?;
@@ -1040,7 +939,7 @@ impl DefaultMultipartUsecase {
         let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
         src_opts.version_id = src_version_id.clone();
 
-        let h = http::HeaderMap::new();
+        let h = HeaderMap::new();
         let get_opts = ObjectOptions {
             version_id: src_opts.version_id.clone(),
             versioned: src_opts.versioned,
@@ -1092,7 +991,7 @@ impl DefaultMultipartUsecase {
             (0, src_info.size)
         };
 
-        let h = http::HeaderMap::new();
+        let h = HeaderMap::new();
         let get_opts = ObjectOptions {
             version_id: src_opts.version_id.clone(),
             versioned: src_opts.versioned,
@@ -1108,8 +1007,6 @@ impl DefaultMultipartUsecase {
 
         let is_compressible = rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
-        let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(src_stream));
-
         let src_decryption_request = DecryptionRequest {
             bucket: &src_bucket,
             key: &src_key,
@@ -1121,23 +1018,74 @@ impl DefaultMultipartUsecase {
             etag: src_info.etag.as_deref(),
         };
 
-        if let Some(material) = sse_decryption(src_decryption_request).await? {
-            reader = material.wrap_single_reader(reader);
-            if let Some(original) = material.original_size {
-                src_info.actual_size = original;
-            }
-        }
-
         let actual_size = length;
         let mut size = length;
 
-        if is_compressible {
-            let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
-            reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
-            size = HashReader::SIZE_PRESERVE_LAYER;
-        }
+        let mut reader = match sse_decryption(src_decryption_request).await? {
+            Some(material) => {
+                if let Some(original) = material.original_size {
+                    src_info.actual_size = original;
+                }
 
-        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                if material.is_multipart {
+                    let (decrypted_stream, plaintext_size) =
+                        material.wrap_reader(src_stream, size).await.map_err(ApiError::from)?;
+                    size = plaintext_size;
+
+                    if is_compressible {
+                        let hrd = HashReader::from_reader(decrypted_stream, size, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                        size = HashReader::SIZE_PRESERVE_LAYER;
+                        HashReader::from_reader(
+                            CompressReader::new(hrd, CompressionAlgorithm::default()),
+                            size,
+                            actual_size,
+                            None,
+                            None,
+                            false,
+                        )
+                        .map_err(ApiError::from)?
+                    } else {
+                        HashReader::from_reader(decrypted_stream, size, actual_size, None, None, false).map_err(ApiError::from)?
+                    }
+                } else if is_compressible {
+                    let hrd =
+                        HashReader::from_stream(material.wrap_single_reader(src_stream), size, actual_size, None, None, false)
+                            .map_err(ApiError::from)?;
+                    size = HashReader::SIZE_PRESERVE_LAYER;
+                    HashReader::from_reader(
+                        CompressReader::new(hrd, CompressionAlgorithm::default()),
+                        size,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    HashReader::from_stream(material.wrap_single_reader(src_stream), size, actual_size, None, None, false)
+                        .map_err(ApiError::from)?
+                }
+            }
+            None => {
+                if is_compressible {
+                    let hrd =
+                        HashReader::from_stream(src_stream, size, actual_size, None, None, false).map_err(ApiError::from)?;
+                    size = HashReader::SIZE_PRESERVE_LAYER;
+                    HashReader::from_reader(
+                        CompressReader::new(hrd, CompressionAlgorithm::default()),
+                        size,
+                        actual_size,
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    HashReader::from_stream(src_stream, size, actual_size, None, None, false).map_err(ApiError::from)?
+                }
+            }
+        };
 
         let server_side_encryption = mp_info
             .user_defined
@@ -1172,26 +1120,48 @@ impl DefaultMultipartUsecase {
 
         encryption_request.check_upload_part_customer_key_md5(&mp_info.user_defined, sse_customer_key_md5.clone())?;
 
-        let (requested_sse, requested_kms_key_id) = match sse_encryption(encryption_request).await? {
+        let (requested_sse, requested_kms_key_id, dst_user_defined) = match sse_encryption(encryption_request).await? {
             Some(material) => {
                 let requested_sse = Some(material.server_side_encryption.clone());
                 let requested_kms_key_id = material.kms_key_id.clone();
 
                 let encrypted_reader = material.wrap_reader(reader);
-                reader = HashReader::new(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
-                    .map_err(ApiError::from)?;
+                reader =
+                    HashReader::from_reader(encrypted_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)
+                        .map_err(ApiError::from)?;
+                let dst_user_defined = merge_part_encryption_metadata(&mp_info.user_defined, &material.metadata);
 
-                mp_info.user_defined.extend(material.metadata);
-
-                (requested_sse, requested_kms_key_id)
+                (requested_sse, requested_kms_key_id, dst_user_defined)
             }
-            None => (None, None),
+            None => (None, None, mp_info.user_defined.clone()),
         };
+
+        if let Some(checksum_algorithm) = mp_info
+            .user_defined
+            .get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM)
+            .filter(|checksum_algorithm| !checksum_algorithm.is_empty())
+        {
+            let checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(
+                checksum_algorithm,
+                mp_info
+                    .user_defined
+                    .get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            );
+            if !checksum_type.is_set() {
+                return Err(ApiError::from(StorageError::other(format!(
+                    "Invalid multipart checksum type: {checksum_algorithm}"
+                )))
+                .into());
+            }
+            reader.add_calculated_checksum(checksum_type).map_err(ApiError::from)?;
+        }
 
         let mut reader = PutObjReader::new(reader);
 
         let dst_opts = ObjectOptions {
-            user_defined: mp_info.user_defined.clone(),
+            user_defined: dst_user_defined,
             ..Default::default()
         };
 
@@ -1200,10 +1170,17 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let copy_checksums = reader.as_hash_reader().content_crc();
+        let checksum_value = |checksum_type: rustfs_rio::ChecksumType| copy_checksums.get(&checksum_type.to_string()).cloned();
+
         let copy_part_result = CopyPartResult {
+            checksum_crc32: checksum_value(rustfs_rio::ChecksumType::CRC32),
+            checksum_crc32c: checksum_value(rustfs_rio::ChecksumType::CRC32C),
+            checksum_sha1: checksum_value(rustfs_rio::ChecksumType::SHA1),
+            checksum_sha256: checksum_value(rustfs_rio::ChecksumType::SHA256),
+            checksum_crc64nvme: checksum_value(rustfs_rio::ChecksumType::CRC64_NVME),
             e_tag: part_info.etag.map(|etag| to_s3s_etag(&etag)),
             last_modified: part_info.last_mod.map(Timestamp::from),
-            ..Default::default()
         };
 
         let output = UploadPartCopyOutput {
@@ -1224,6 +1201,9 @@ impl DefaultMultipartUsecase {
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri, header::HeaderValue};
+    use rustfs_filemeta::ObjectPartInfo;
+    use std::{collections::HashMap, io::Cursor};
+    use tokio::io::AsyncReadExt;
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -1278,6 +1258,161 @@ mod tests {
         assert_eq!(location, "/bucket/nested/object");
     }
 
+    #[test]
+    fn merge_part_encryption_metadata_keeps_source_metadata_unchanged() {
+        let multipart_metadata = HashMap::from([
+            ("x-rustfs-encryption-iv".to_string(), "base-nonce".to_string()),
+            ("x-rustfs-encryption-key".to_string(), "base-key".to_string()),
+        ]);
+        let part_metadata = HashMap::from([
+            ("x-rustfs-encryption-iv".to_string(), "part-nonce".to_string()),
+            ("x-rustfs-encryption-original-size".to_string(), "1024".to_string()),
+        ]);
+
+        let merged = merge_part_encryption_metadata(&multipart_metadata, &part_metadata);
+
+        assert_eq!(multipart_metadata.get("x-rustfs-encryption-iv").map(String::as_str), Some("base-nonce"));
+        assert_eq!(merged.get("x-rustfs-encryption-iv").map(String::as_str), Some("part-nonce"));
+        assert_eq!(merged.get("x-rustfs-encryption-key").map(String::as_str), Some("base-key"));
+    }
+
+    #[tokio::test]
+    async fn managed_multipart_roundtrip_preserves_session_nonce_between_parts() {
+        let prepare_request = PrepareEncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            ssekms_key_id: None,
+            sse_customer_algorithm: None,
+            sse_customer_key_md5: None,
+        };
+        let session_material = sse_prepare_encryption(prepare_request)
+            .await
+            .expect("prepare multipart encryption")
+            .expect("managed multipart session material");
+        let session_metadata = session_material.metadata.clone();
+        let session_nonce = session_metadata
+            .get("x-rustfs-encryption-iv")
+            .cloned()
+            .expect("session nonce metadata");
+        let part_key = session_metadata.get("x-rustfs-encryption-key").cloned();
+        let part_nonce = Some(session_nonce.clone());
+
+        let part_one_plaintext = vec![0x31; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 23];
+        let part_two_plaintext = vec![0x32; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE * 2 + 7];
+
+        let part_one_material = sse_encryption(EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: Some(session_material.server_side_encryption.clone()),
+            ssekms_key_id: session_material.kms_key_id.clone(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: part_one_plaintext.len() as i64,
+            part_number: Some(1),
+            part_key: part_key.clone(),
+            part_nonce: part_nonce.clone(),
+        })
+        .await
+        .expect("encrypt part one")
+        .expect("part one material");
+        let part_one_metadata = merge_part_encryption_metadata(&session_metadata, &part_one_material.metadata);
+        let mut encrypted_one = Vec::new();
+        part_one_material
+            .wrap_reader(Cursor::new(part_one_plaintext.clone()))
+            .read_to_end(&mut encrypted_one)
+            .await
+            .expect("read encrypted part one");
+
+        let part_two_material = sse_encryption(EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: Some(session_material.server_side_encryption.clone()),
+            ssekms_key_id: session_material.kms_key_id.clone(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: part_two_plaintext.len() as i64,
+            part_number: Some(2),
+            part_key,
+            part_nonce,
+        })
+        .await
+        .expect("encrypt part two")
+        .expect("part two material");
+        let part_two_metadata = merge_part_encryption_metadata(&session_metadata, &part_two_material.metadata);
+        let mut encrypted_two = Vec::new();
+        part_two_material
+            .wrap_reader(Cursor::new(part_two_plaintext.clone()))
+            .read_to_end(&mut encrypted_two)
+            .await
+            .expect("read encrypted part two");
+
+        assert_eq!(
+            session_metadata.get("x-rustfs-encryption-iv").map(String::as_str),
+            Some(session_nonce.as_str())
+        );
+        assert_ne!(
+            part_one_metadata.get("x-rustfs-encryption-iv"),
+            session_metadata.get("x-rustfs-encryption-iv")
+        );
+        assert_ne!(
+            part_two_metadata.get("x-rustfs-encryption-iv"),
+            session_metadata.get("x-rustfs-encryption-iv")
+        );
+
+        let parts = vec![
+            ObjectPartInfo {
+                number: 1,
+                size: encrypted_one.len(),
+                actual_size: part_one_plaintext.len() as i64,
+                ..Default::default()
+            },
+            ObjectPartInfo {
+                number: 2,
+                size: encrypted_two.len(),
+                actual_size: part_two_plaintext.len() as i64,
+                ..Default::default()
+            },
+        ];
+
+        let mut encrypted_stream = Vec::with_capacity(encrypted_one.len() + encrypted_two.len());
+        encrypted_stream.extend_from_slice(&encrypted_one);
+        encrypted_stream.extend_from_slice(&encrypted_two);
+
+        let decryption_material = sse_decryption(DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &session_metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            part_number: None,
+            parts: &parts,
+            etag: Some("multipart-etag"),
+        })
+        .await
+        .expect("decrypt multipart")
+        .expect("managed decryption material");
+
+        let (mut decrypted_reader, plaintext_size) = decryption_material
+            .wrap_reader(Cursor::new(encrypted_stream), -1)
+            .await
+            .expect("wrap multipart reader");
+
+        let mut decrypted = Vec::new();
+        decrypted_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("read decrypted multipart data");
+
+        let mut expected = part_one_plaintext;
+        expected.extend_from_slice(&part_two_plaintext);
+
+        assert_eq!(plaintext_size, expected.len() as i64);
+        assert_eq!(decrypted, expected);
+    }
+
     #[tokio::test]
     async fn execute_abort_multipart_upload_returns_internal_error_when_store_uninitialized() {
         let input = AbortMultipartUploadInput::builder()
@@ -1316,7 +1451,9 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::POST);
 
-        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
     }
 
@@ -1343,7 +1480,9 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::POST);
 
-        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+            .await
+            .unwrap_err();
         assert_ne!(err.code(), &S3ErrorCode::InvalidPartOrder);
     }
 
@@ -1370,7 +1509,9 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::POST);
 
-        let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidPartOrder);
     }
 
@@ -1420,7 +1561,9 @@ mod tests {
             let mut req = build_request(input, Method::POST);
             req.headers.insert(header_name, HeaderValue::from_str(header_value).unwrap());
 
-            let err = make_usecase().execute_complete_multipart_upload(req).await.unwrap_err();
+            let err = Box::pin(make_usecase().execute_complete_multipart_upload(req))
+                .await
+                .unwrap_err();
             assert_eq!(err.code(), &S3ErrorCode::InvalidRequest, "header {header_name} should be rejected");
         }
     }
@@ -1438,6 +1581,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_list_multipart_uploads_rejects_invalid_key_marker_before_store_lookup() {
+        let input = ListMultipartUploadsInput::builder()
+            .bucket("bucket".to_string())
+            .prefix(Some("prefix/".to_string()))
+            .key_marker(Some("other/key".to_string()))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let err = make_usecase().execute_list_multipart_uploads(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_eq!(err.message(), Some("Invalid key marker"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_multipart_uploads_rejects_invalid_max_uploads_before_store_lookup() {
+        let input = ListMultipartUploadsInput::builder()
+            .bucket("bucket".to_string())
+            .max_uploads(Some(0))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+        let expected = "max-uploads must be between 1 and 1000";
+
+        let err = make_usecase().execute_list_multipart_uploads(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some(expected));
+    }
+
+    #[tokio::test]
     async fn execute_list_parts_returns_internal_error_when_store_uninitialized() {
         let input = ListPartsInput::builder()
             .bucket("bucket".to_string())
@@ -1449,6 +1622,38 @@ mod tests {
 
         let err = make_usecase().execute_list_parts(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[tokio::test]
+    async fn execute_list_parts_rejects_negative_part_number_marker_before_store_lookup() {
+        let input = ListPartsInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .upload_id("upload-id".to_string())
+            .part_number_marker(Some(-1))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let err = make_usecase().execute_list_parts(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("part-number-marker must be non-negative"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_parts_rejects_invalid_max_parts_before_store_lookup() {
+        let input = ListPartsInput::builder()
+            .bucket("bucket".to_string())
+            .key("object".to_string())
+            .upload_id("upload-id".to_string())
+            .max_parts(Some(1001))
+            .build()
+            .unwrap();
+        let req = build_request(input, Method::GET);
+
+        let err = make_usecase().execute_list_parts(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("max-parts must be between 1 and 1000"));
     }
 
     #[tokio::test]
@@ -1467,7 +1672,7 @@ mod tests {
             .unwrap();
         let req = build_request(input, Method::PUT);
 
-        let err = make_usecase().execute_upload_part_copy(req).await.unwrap_err();
+        let err = Box::pin(make_usecase().execute_upload_part_copy(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 

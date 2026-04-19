@@ -71,7 +71,7 @@ export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
 export RUSTFS_OBS_ENVIRONMENT=production # Environment name development, staging, production
 export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
-#export RUSTFS_OBS_LOG_STDOUT_ENABLED=true # Whether to enable local stdout logging
+export RUSTFS_OBS_LOG_STDOUT_ENABLED=true # Whether to enable local stdout logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="minutely" # Log rotation time unit, can be "minutely", "hourly", "daily"
 export RUSTFS_OBS_LOG_KEEP_FILES=10 # Number of log files to keep
@@ -240,9 +240,6 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 export RUSTFS_SCANNER_ENABLED=true
 
 export RUSTFS_HEAL_ENABLED=true
-
-# Object cache configuration
-export RUSTFS_OBJECT_CACHE_ENABLE=true
 
 # Profiling configuration
 export RUSTFS_ENABLE_PROFILING=false

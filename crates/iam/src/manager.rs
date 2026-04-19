@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result, is_err_config_not_found};
-use crate::sys::get_claims_from_token_with_secret;
+use crate::sys::{get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp};
 use crate::{
     cache::{Cache, CacheEntity},
     error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
@@ -429,7 +429,7 @@ where
                 p.update(policy.clone());
                 p
             })
-            .unwrap_or(PolicyDoc::new(policy));
+            .unwrap_or_else(|| PolicyDoc::new(policy));
 
         self.api.save_policy_doc(name, policy_doc.clone()).await?;
 
@@ -450,7 +450,7 @@ where
 
         self.cache.policy_docs.store(Arc::new(cache));
 
-        let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.policy.clone())).collect();
+        let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.policy)).collect();
 
         let futures: Vec<_> = items.iter().map(|(_, policy)| policy.match_resource(bucket_name)).collect();
 
@@ -516,7 +516,7 @@ where
 
         self.cache.policy_docs.store(Arc::new(cache));
 
-        let items: Vec<_> = m.into_iter().map(|(k, v)| (k, v.clone())).collect();
+        let items: Vec<_> = m.into_iter().collect();
 
         let futures: Vec<_> = items
             .iter()
@@ -687,6 +687,8 @@ where
             cr.description = opts.description;
         }
 
+        let token_without_expiration = cr.expiration.is_none();
+
         if opts.expiration.is_some() {
             // TODO: check expiration
             cr.expiration = opts.expiration;
@@ -702,7 +704,11 @@ where
             }
         }
 
-        let mut m: HashMap<String, Value> = get_claims_from_token_with_secret(&cr.session_token, &current_secret_key)?;
+        let mut m: HashMap<String, Value> = if token_without_expiration {
+            get_claims_from_token_with_secret_allow_missing_exp(&cr.session_token, &current_secret_key)?
+        } else {
+            get_claims_from_token_with_secret(&cr.session_token, &current_secret_key)?
+        };
         m.remove(SESSION_POLICY_NAME_EXTRACTED);
 
         let nosp = if let Some(policy) = &opts.session_policy {
@@ -732,6 +738,10 @@ where
             }
         }
 
+        if let Some(expiration) = opts.expiration {
+            m.insert("exp".to_owned(), Value::Number(serde_json::Number::from(expiration.unix_timestamp())));
+        }
+
         m.insert("accessKey".to_owned(), Value::String(name.to_owned()));
 
         cr.session_token = jwt_sign(&m, &cr.secret_key)?;
@@ -755,7 +765,11 @@ where
 
         if let Some(groups) = groups {
             for group in groups.iter() {
-                let (gp, _) = self.policy_db_get_internal(group, true, present).await?;
+                let (gp, _) = match self.policy_db_get_internal(group, true, present).await {
+                    Ok(result) => result,
+                    Err(err) if is_err_no_such_group(&err) => continue,
+                    Err(err) => return Err(err),
+                };
                 gp.iter().for_each(|v| {
                     policies.push(v.clone());
                 });
@@ -783,7 +797,7 @@ where
                         Cache::add_or_update(&self.cache.groups, name, p, OffsetDateTime::now_utc());
                     }
 
-                    m.get(name).cloned().ok_or(Error::NoSuchGroup(name.to_string()))?
+                    m.get(name).cloned().ok_or_else(|| Error::NoSuchGroup(name.to_string()))?
                 }
             };
 
@@ -1333,7 +1347,11 @@ where
     fn update_user_with_claims(&self, k: &str, u: UserIdentity) -> Result<()> {
         let mut u = u;
         if !u.credentials.session_token.is_empty() {
-            u.credentials.claims = Some(extract_jwt_claims(&u)?);
+            u.credentials.claims = Some(if u.credentials.expiration.is_none() {
+                extract_jwt_claims_allow_missing_exp(&u)?
+            } else {
+                extract_jwt_claims(&u)?
+            });
         }
 
         if u.credentials.is_temp() && !u.credentials.is_service_account() {
@@ -1434,7 +1452,7 @@ where
             .load()
             .get(name)
             .cloned()
-            .ok_or(Error::NoSuchGroup(name.to_string()))?;
+            .ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
 
         let mapped_policy = if let Some(policy) = self.cache.group_policies.load().get(name).cloned() {
             Some(policy)
@@ -1493,7 +1511,7 @@ where
             .load()
             .get(name)
             .cloned()
-            .ok_or(Error::NoSuchGroup(name.to_string()))?;
+            .ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
 
         let s: HashSet<&String> = HashSet::from_iter(gi.members.iter());
         let d: HashSet<&String> = HashSet::from_iter(members.iter());
@@ -1538,14 +1556,14 @@ where
             // Reload from backend so we see latest members (e.g. after user was deleted elsewhere)
             let mut m = HashMap::new();
             self.api.load_group(group, &mut m).await?;
-            m.get(group).cloned().ok_or(Error::NoSuchGroup(group.to_string()))?
+            m.get(group).cloned().ok_or_else(|| Error::NoSuchGroup(group.to_string()))?
         } else {
             self.cache
                 .groups
                 .load()
                 .get(group)
                 .cloned()
-                .ok_or(Error::NoSuchGroup(group.to_string()))?
+                .ok_or_else(|| Error::NoSuchGroup(group.to_string()))?
         };
 
         if members.is_empty() && !gi.members.is_empty() {
@@ -1858,7 +1876,7 @@ fn set_default_canned_policies(policies: &mut HashMap<String, PolicyDoc>) {
 
 pub fn get_token_signing_key() -> Option<String> {
     if let Some(s) = get_global_action_cred() {
-        Some(s.secret_key.clone())
+        Some(s.secret_key)
     } else {
         None
     }
@@ -1873,6 +1891,21 @@ pub fn extract_jwt_claims(u: &UserIdentity) -> Result<HashMap<String, Value>> {
 
     for key in keys {
         if let Ok(claims) = get_claims_from_token_with_secret(&u.credentials.session_token, key) {
+            return Ok(claims);
+        }
+    }
+    Err(Error::other("unable to extract claims"))
+}
+
+pub fn extract_jwt_claims_allow_missing_exp(u: &UserIdentity) -> Result<HashMap<String, Value>> {
+    let Some(sys_key) = get_token_signing_key() else {
+        return Err(Error::other("global active sk not init"));
+    };
+
+    let keys = vec![&sys_key, &u.credentials.secret_key];
+
+    for key in keys {
+        if let Ok(claims) = get_claims_from_token_with_secret_allow_missing_exp(&u.credentials.session_token, key) {
             return Ok(claims);
         }
     }
@@ -2168,7 +2201,7 @@ mod tests {
             name: Some("service-account-name".to_string()),
             description: Some("Updated service account".to_string()),
             expiration: None,
-            session_policy: Some(policy.clone()),
+            session_policy: Some(policy),
         };
 
         assert_eq!(opts.secret_key, Some("new-secret-key".to_string()));

@@ -18,9 +18,14 @@ use crate::{
     error::{LockError, Result},
     types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
 };
+use futures::future::join_all;
+use rustfs_io_metrics::{
+    record_read_lock_held_acquire, record_read_lock_held_release, record_write_lock_held_acquire, record_write_lock_held_release,
+};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -52,12 +57,13 @@ static UNLOCK_RUNTIME: LazyLock<UnlockRuntime> = LazyLock::new(|| {
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             // Best-effort release across all (LockId, client) entries.
-            let mut any_ok = false;
-            for (lock_id, client) in job.entries.into_iter() {
-                if client.release(&lock_id).await.unwrap_or(false) {
-                    any_ok = true;
-                }
-            }
+            let results = join_all(
+                job.entries
+                    .into_iter()
+                    .map(|(lock_id, client)| async move { client.release(&lock_id).await.unwrap_or(false) }),
+            )
+            .await;
+            let any_ok = results.into_iter().any(|released| released);
 
             if !any_ok {
                 tracing::warn!("DistributedLockGuard background release failed for one or more entries");
@@ -79,6 +85,7 @@ pub struct DistributedLockGuard {
     /// All underlying (LockId, client) entries that should be released when the
     /// guard is dropped.
     entries: Vec<(LockId, Arc<dyn LockClient>)>,
+    lock_type: LockType,
     /// If true, Drop will not try to release (used if user manually released).
     disarmed: bool,
 }
@@ -89,10 +96,12 @@ impl DistributedLockGuard {
     /// - `lock_id` is the id returned to the caller (`lock_id()`).
     /// - `entries` is the full list of underlying (LockId, client) pairs
     ///   that should be released when this guard is dropped.
-    pub(crate) fn new(lock_id: LockId, entries: Vec<(LockId, Arc<dyn LockClient>)>) -> Self {
+    pub(crate) fn new(lock_id: LockId, entries: Vec<(LockId, Arc<dyn LockClient>)>, lock_type: LockType) -> Self {
+        record_lock_held_acquire(lock_type);
         Self {
             lock_id,
             entries,
+            lock_type,
             disarmed: false,
         }
     }
@@ -105,6 +114,9 @@ impl DistributedLockGuard {
     /// Manually disarm the guard so dropping it won't release the lock.
     /// Call this if you explicitly released the lock elsewhere.
     pub fn disarm(&mut self) {
+        if !self.disarmed {
+            record_lock_held_release(self.lock_type);
+        }
         self.disarmed = true;
     }
 
@@ -142,7 +154,7 @@ impl DistributedLockGuard {
                 let futures_iter = entries
                     .into_iter()
                     .map(|(lock_id, client)| async move { client.release(&lock_id).await.unwrap_or(false) });
-                let _ = futures::future::join_all(futures_iter).await;
+                let _ = join_all(futures_iter).await;
             });
             // Explicitly drop the JoinHandle to acknowledge detaching the task.
             drop(handle);
@@ -153,6 +165,7 @@ impl DistributedLockGuard {
 
         // Disarm to prevent double-release on drop
         self.disarmed = true;
+        record_lock_held_release(self.lock_type);
         success
     }
 }
@@ -174,9 +187,11 @@ pub struct DistributedLock {
     clients: Vec<Arc<dyn LockClient>>,
     /// Namespace identifier
     namespace: String,
-    /// Quorum size for operations (majority for distributed)
+    /// Quorum size for exclusive/write operations
     quorum: usize,
 }
+
+type LockAcquireTaskResult = (usize, Result<LockResponse>);
 
 impl DistributedLock {
     /// Create new distributed lock
@@ -199,6 +214,22 @@ impl DistributedLock {
         &self.namespace
     }
 
+    fn read_quorum(&self) -> usize {
+        let client_count = self.clients.len();
+        if client_count <= 1 {
+            1
+        } else {
+            client_count - (client_count / 2)
+        }
+    }
+
+    fn required_quorum(&self, lock_type: LockType) -> usize {
+        match lock_type {
+            LockType::Shared => self.read_quorum(),
+            LockType::Exclusive => self.quorum,
+        }
+    }
+
     /// Get resource key for this namespace
     pub fn get_resource_key(&self, resource: &ObjectKey) -> String {
         format!("{}:{}", self.namespace, resource)
@@ -215,6 +246,7 @@ impl DistributedLock {
             return Err(LockError::internal("No lock clients available"));
         }
 
+        let required_quorum = self.required_quorum(request.lock_type);
         let (resp, individual_locks) = self.acquire_lock_quorum(request).await?;
         if resp.success {
             // Use aggregate lock_id from LockResponse's LockInfo
@@ -226,7 +258,7 @@ impl DistributedLock {
                 .map(|info| info.id.clone())
                 .unwrap_or_else(|| LockId::new_unique(&request.resource));
 
-            Ok(Some(DistributedLockGuard::new(aggregate_lock_id, individual_locks)))
+            Ok(Some(DistributedLockGuard::new(aggregate_lock_id, individual_locks, request.lock_type)))
         } else {
             // Check if it's a timeout or quorum failure
             if let Some(error_msg) = &resp.error {
@@ -247,10 +279,9 @@ impl DistributedLock {
                 }
                 if error_msg.contains("quorum") {
                     // This is a quorum failure - return appropriate error
-                    // Extract achieved count from error message or use individual_locks.len()
                     let achieved = individual_locks.len();
                     Err(LockError::QuorumNotReached {
-                        required: self.quorum,
+                        required: required_quorum,
                         achieved,
                     })
                 } else if error_msg.contains("timeout") || resp.wait_time >= request.acquire_timeout {
@@ -309,101 +340,212 @@ impl DistributedLock {
         self.acquire_guard(&req).await
     }
 
-    /// Quorum-based lock acquisition: success if at least `self.quorum` clients succeed.
+    fn spawn_lock_requests(&self, request: &LockRequest) -> JoinSet<LockAcquireTaskResult> {
+        let mut pending = JoinSet::new();
+        for (idx, client) in self.clients.iter().cloned().enumerate() {
+            let request = request.clone();
+            pending.spawn(async move { (idx, client.acquire_lock(&request).await) });
+        }
+        pending
+    }
+
+    async fn release_entries(entries: &[(LockId, Arc<dyn LockClient>)], context: &'static str) {
+        let release_results = join_all(
+            entries
+                .iter()
+                .map(|(lock_id, client)| async move { (lock_id, client.release(lock_id).await) }),
+        )
+        .await;
+
+        for (lock_id, result) in release_results {
+            match result {
+                Ok(true) | Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!("{context}: failed to release lock {} on client: {}", lock_id, err);
+                }
+            }
+        }
+    }
+
+    fn spawn_pending_cleanup(
+        mut pending: JoinSet<LockAcquireTaskResult>,
+        clients: Vec<Arc<dyn LockClient>>,
+        fallback_lock_id: LockId,
+        context: &'static str,
+    ) {
+        let handle = tokio::spawn(async move {
+            while let Some(join_result) = pending.join_next().await {
+                match join_result {
+                    Ok((idx, Ok(resp))) if resp.success => {
+                        let lock_id = resp
+                            .lock_info
+                            .as_ref()
+                            .map(|info| info.id.clone())
+                            .unwrap_or_else(|| fallback_lock_id.clone());
+                        let Some(client) = clients.get(idx) else {
+                            tracing::warn!("{context}: missing client for pending lock cleanup at index {}", idx);
+                            continue;
+                        };
+
+                        if let Err(err) = client.release(&lock_id).await {
+                            tracing::warn!("{context}: failed to cleanup late lock {} on client {}: {}", lock_id, idx, err);
+                        }
+                    }
+                    Ok((idx, Ok(resp))) => {
+                        tracing::debug!(
+                            "{context}: pending lock request on client {} completed without success: {:?}",
+                            idx,
+                            resp.error
+                        );
+                    }
+                    Ok((idx, Err(err))) => {
+                        tracing::warn!("{context}: pending lock request on client {} failed: {}", idx, err);
+                    }
+                    Err(err) => {
+                        tracing::warn!("{context}: pending lock cleanup task join failed: {}", err);
+                    }
+                }
+            }
+        });
+        drop(handle);
+    }
+
+    fn log_failed_lock_response(&self, request: &LockRequest, idx: usize, error: String) {
+        if request.suppress_contention_logs {
+            tracing::debug!(
+                resource = %request.resource,
+                owner = %request.owner,
+                "Failed to acquire lock on client from response: {}, error: {}",
+                idx,
+                error
+            );
+        } else {
+            tracing::warn!(
+                resource = %request.resource,
+                owner = %request.owner,
+                "Failed to acquire lock on client from response: {}, error: {}",
+                idx,
+                error
+            );
+        }
+    }
+
+    /// Quorum-based lock acquisition: success if at least the required quorum succeeds.
     /// Collects all individual lock_ids from successful clients and creates an aggregate lock_id.
     /// Returns the LockResponse with aggregate lock_id and individual lock mappings.
     async fn acquire_lock_quorum(&self, request: &LockRequest) -> Result<(LockResponse, Vec<(LockId, Arc<dyn LockClient>)>)> {
-        let futs: Vec<_> = self
-            .clients
-            .iter()
-            .enumerate()
-            .map(|(idx, client)| async move { (idx, client.acquire_lock(request).await) })
-            .collect();
-
-        let results = futures::future::join_all(futs).await;
-        // Store all individual lock_ids and their corresponding clients
+        let required_quorum = self.required_quorum(request.lock_type);
+        let mut pending = self.spawn_lock_requests(request);
         let mut individual_locks: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
+        let fallback_lock_id = request.lock_id.clone();
 
-        for (idx, result) in results {
-            match result {
-                Ok(resp) => {
+        while let Some(join_result) = pending.join_next().await {
+            match join_result {
+                Ok((idx, Ok(resp))) => {
                     if resp.success {
-                        // Collect individual lock_id and client for each successful acquisition
-                        if let Some(lock_info) = &resp.lock_info
-                            && idx < self.clients.len()
-                        {
-                            // Save the individual lock_id returned by each client
-                            individual_locks.push((lock_info.id.clone(), self.clients[idx].clone()));
+                        let lock_id = resp
+                            .lock_info
+                            .as_ref()
+                            .map(|info| info.id.clone())
+                            .unwrap_or_else(|| fallback_lock_id.clone());
+
+                        if let Some(client) = self.clients.get(idx) {
+                            individual_locks.push((lock_id, client.clone()));
+                        } else {
+                            tracing::warn!("Missing lock client at index {} while recording success", idx);
                         }
                     } else {
                         let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
-                        if request.suppress_contention_logs {
-                            tracing::debug!(
-                                resource = %request.resource,
-                                owner = %request.owner,
-                                "Failed to acquire lock on client from response: {}, error: {}",
-                                idx,
-                                error
-                            );
-                        } else {
-                            tracing::warn!(
-                                resource = %request.resource,
-                                owner = %request.owner,
-                                "Failed to acquire lock on client from response: {}, error: {}",
-                                idx,
-                                error
-                            );
-                        }
+                        self.log_failed_lock_response(request, idx, error);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to acquire lock on client {}: {}", idx, e);
+                Ok((idx, Err(err))) => {
+                    tracing::warn!("Failed to acquire lock on client {}: {}", idx, err);
                 }
-            }
-        }
-
-        if individual_locks.len() >= self.quorum {
-            // Generate a new aggregate lock_id for multiple client locks
-            let aggregate_lock_id = generate_aggregate_lock_id(&request.resource);
-
-            tracing::debug!(
-                "Generated aggregate lock_id {} for {} individual locks on resource {}",
-                aggregate_lock_id,
-                individual_locks.len(),
-                request.resource
-            );
-
-            let resp = LockResponse::success(
-                LockInfo {
-                    id: aggregate_lock_id,
-                    resource: request.resource.clone(),
-                    lock_type: request.lock_type,
-                    status: LockStatus::Acquired,
-                    owner: request.owner.clone(),
-                    acquired_at: std::time::SystemTime::now(),
-                    expires_at: std::time::SystemTime::now() + request.ttl,
-                    last_refreshed: std::time::SystemTime::now(),
-                    metadata: request.metadata.clone(),
-                    priority: request.priority,
-                    wait_start_time: None,
-                },
-                Duration::ZERO,
-            );
-            Ok((resp, individual_locks))
-        } else {
-            // Rollback: release all locks that were successfully acquired
-            let rollback_count = individual_locks.len();
-            for (individual_lock_id, client) in individual_locks {
-                if let Err(e) = client.release(&individual_lock_id).await {
-                    tracing::warn!("Failed to rollback lock {} on client: {}", individual_lock_id, e);
+                Err(err) => {
+                    tracing::warn!("Lock acquisition task join failed: {}", err);
                 }
             }
 
-            let resp = LockResponse::failure(
-                format!("Failed to acquire quorum: {}/{} required", rollback_count, self.quorum),
-                Duration::ZERO,
-            );
-            Ok((resp, Vec::new()))
+            if individual_locks.len() >= required_quorum {
+                if !pending.is_empty() {
+                    Self::spawn_pending_cleanup(
+                        pending,
+                        self.clients.clone(),
+                        fallback_lock_id.clone(),
+                        "distributed_lock_success_cleanup",
+                    );
+                }
+
+                let aggregate_lock_id = generate_aggregate_lock_id(&request.resource);
+                tracing::debug!(
+                    "Generated aggregate lock_id {} for {} individual locks on resource {}",
+                    aggregate_lock_id,
+                    individual_locks.len(),
+                    request.resource
+                );
+
+                let resp = LockResponse::success(
+                    LockInfo {
+                        id: aggregate_lock_id,
+                        resource: request.resource.clone(),
+                        lock_type: request.lock_type,
+                        status: LockStatus::Acquired,
+                        owner: request.owner.clone(),
+                        acquired_at: std::time::SystemTime::now(),
+                        expires_at: std::time::SystemTime::now() + request.ttl,
+                        last_refreshed: std::time::SystemTime::now(),
+                        metadata: request.metadata.clone(),
+                        priority: request.priority,
+                        wait_start_time: None,
+                    },
+                    Duration::ZERO,
+                );
+                return Ok((resp, individual_locks));
+            }
+
+            if individual_locks.len() + pending.len() < required_quorum {
+                let rollback_count = individual_locks.len();
+                Self::release_entries(&individual_locks, "distributed_lock_quorum_rollback").await;
+                if !pending.is_empty() {
+                    Self::spawn_pending_cleanup(
+                        pending,
+                        self.clients.clone(),
+                        fallback_lock_id.clone(),
+                        "distributed_lock_failure_cleanup",
+                    );
+                }
+
+                let resp = LockResponse::failure(
+                    format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required"),
+                    Duration::ZERO,
+                );
+                return Ok((resp, individual_locks));
+            }
         }
+
+        let rollback_count = individual_locks.len();
+        Self::release_entries(&individual_locks, "distributed_lock_quorum_rollback").await;
+        let resp = LockResponse::failure(
+            format!("Failed to acquire quorum: {rollback_count}/{required_quorum} required"),
+            Duration::ZERO,
+        );
+        Ok((resp, individual_locks))
+    }
+}
+
+#[inline(always)]
+fn record_lock_held_acquire(lock_type: LockType) {
+    match lock_type {
+        LockType::Shared => record_read_lock_held_acquire(),
+        LockType::Exclusive => record_write_lock_held_acquire(),
+    }
+}
+
+#[inline(always)]
+fn record_lock_held_release(lock_type: LockType) {
+    match lock_type {
+        LockType::Shared => record_read_lock_held_release(),
+        LockType::Exclusive => record_write_lock_held_release(),
     }
 }

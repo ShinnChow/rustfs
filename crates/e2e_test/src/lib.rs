@@ -56,6 +56,9 @@ mod special_chars_test;
 #[cfg(test)]
 mod content_encoding_test;
 
+#[cfg(test)]
+mod archive_download_integrity_test;
+
 // ListObjectsV2 pagination test (Issue #1596)
 #[cfg(test)]
 mod list_objects_v2_pagination_test;
@@ -74,6 +77,14 @@ mod delete_objects_versioning_test;
 // Regression test for Issue #2252: ListObjectVersions misses newest version after put -> delete -> put
 #[cfg(test)]
 mod list_object_versions_regression_test;
+
+// versions&metadata=true extension regression test
+#[cfg(test)]
+mod list_object_versions_metadata_extension_test;
+
+// list-type=2&metadata=true extension regression test
+#[cfg(test)]
+mod list_objects_v2_metadata_extension_test;
 
 #[cfg(test)]
 mod protocols;
@@ -100,6 +111,9 @@ mod bucket_logging_test;
 // Multipart control API auth regression tests
 #[cfg(test)]
 mod multipart_auth_test;
+
+#[cfg(test)]
+mod stale_multipart_cleanup_cluster_test;
 
 // Object lambda end-to-end regression tests
 #[cfg(test)]
