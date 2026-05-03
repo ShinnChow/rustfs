@@ -21,7 +21,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::BackendInfo;
 
-#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum AccountStatus {
     #[serde(rename = "enabled")]
     Enabled,
@@ -94,7 +94,7 @@ pub struct UserInfo {
     pub updated_at: Option<OffsetDateTime>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddOrUpdateUserReq {
     #[serde(rename = "secretKey")]
     pub secret_key: String,
@@ -1264,10 +1264,10 @@ mod tests {
         // Test very long strings
         let long_string = "a".repeat(1000);
         let long_req = AddServiceAccountReq {
-            policy: Some(serde_json::json!({"Statement": [long_string.clone()]})),
+            policy: Some(serde_json::json!({"Statement": [long_string]})),
             target_user: Some(long_string.clone()),
             access_key: long_string.clone(),
-            secret_key: long_string.clone(),
+            secret_key: long_string,
             name: Some("valid_name".to_string()),
             description: Some("valid description".to_string()),
             expiration: None,

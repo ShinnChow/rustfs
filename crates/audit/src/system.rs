@@ -13,15 +13,24 @@
 //  limitations under the License.
 
 use crate::{AuditEntry, AuditError, AuditRegistry, AuditResult, observability};
+use hashbrown::HashMap;
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
     StoreError, Target, TargetError,
     store::{Key, Store},
-    target::EntityTarget,
+    target::{EntityTarget, QueuedPayload},
 };
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{error, info, warn};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditTargetMetricSnapshot {
+    pub failed_messages: u64,
+    pub queue_length: u64,
+    pub target_id: String,
+    pub total_messages: u64,
+}
 
 /// State of the audit system
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +48,8 @@ pub struct AuditSystem {
     registry: Arc<Mutex<AuditRegistry>>,
     state: Arc<RwLock<AuditSystemState>>,
     config: Arc<RwLock<Option<Config>>>,
+    /// Cancellation senders for active audit stream tasks (target_id -> cancel tx)
+    stream_cancellers: Arc<RwLock<HashMap<String, mpsc::Sender<()>>>>,
 }
 
 impl Default for AuditSystem {
@@ -54,6 +65,7 @@ impl AuditSystem {
             registry: Arc::new(Mutex::new(AuditRegistry::new())),
             state: Arc::new(RwLock::new(AuditSystemState::Stopped)),
             config: Arc::new(RwLock::new(None)),
+            stream_cancellers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -110,27 +122,7 @@ impl AuditSystem {
 
                 // Initialize all targets
                 for target in targets {
-                    let target_id = target.id().to_string();
-                    if let Err(e) = target.init().await {
-                        error!(target_id = %target_id, error = %e, "Failed to initialize audit target");
-                    } else {
-                        // After successful initialization, if enabled and there is a store, start the send from storage task
-                        if target.is_enabled() {
-                            if let Some(store) = target.store() {
-                                info!(target_id = %target_id, "Start audit stream processing for target");
-                                let store_clone: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send> =
-                                    store.boxed_clone();
-                                let target_arc: Arc<dyn Target<AuditEntry> + Send + Sync> = Arc::from(target.clone_dyn());
-                                self.start_audit_stream_with_batching(store_clone, target_arc);
-                                info!(target_id = %target_id, "Audit stream processing started");
-                            } else {
-                                info!(target_id = %target_id, "No store configured, skip audit stream processing");
-                            }
-                        } else {
-                            info!(target_id = %target_id, "Target disabled, skip audit stream processing");
-                        }
-                        registry.add_target(target_id, target);
-                    }
+                    self.init_and_register_target(target, &mut registry).await;
                 }
 
                 // Update state to running
@@ -214,6 +206,9 @@ impl AuditSystem {
 
         info!("Stopping audit system");
 
+        // Stop all stream tasks first
+        self.stop_all_streams().await;
+
         // Close all targets
         let mut registry = self.registry.lock().await;
         if let Err(e) = registry.close_all().await {
@@ -258,52 +253,49 @@ impl AuditSystem {
         let state = self.state.read().await;
 
         match *state {
-            AuditSystemState::Running => {
-                // Continue with dispatch
-                info!("Dispatching audit log entry");
-            }
+            AuditSystemState::Running => {}
             AuditSystemState::Paused => {
-                // Skip dispatch when paused
                 return Ok(());
             }
             _ => {
-                // Don't dispatch when not running
                 return Err(AuditError::NotInitialized("Audit system is not running".to_string()));
             }
         }
         drop(state);
 
-        let registry = self.registry.lock().await;
-        let target_keys = registry.list_targets();
+        // Collect cloned targets under lock, then dispatch without holding it
+        let targets: Vec<(String, Box<dyn Target<AuditEntry> + Send + Sync>)> = {
+            let registry = self.registry.lock().await;
+            let target_keys = registry.list_targets();
 
-        if target_keys.is_empty() {
-            warn!("No audit targets configured for dispatch");
-            return Ok(());
-        }
+            if target_keys.is_empty() {
+                warn!("No audit targets configured for dispatch");
+                return Ok(());
+            }
 
-        // Dispatch to all targets concurrently
+            target_keys
+                .into_iter()
+                .filter_map(|key| registry.get_target(&key).map(|t| (key, t.clone_dyn())))
+                .collect()
+        };
+
+        // Dispatch to all targets concurrently (no lock held)
         let mut tasks = Vec::new();
 
-        for target_key in target_keys {
-            if let Some(target) = registry.get_target(&target_key) {
-                let entry_clone = Arc::clone(&entry);
-                let target_key_clone = target_key.clone();
+        for (target_key, target) in targets {
+            let entity_target = EntityTarget {
+                object_name: entry.api.name.clone().unwrap_or_default(),
+                bucket_name: entry.api.bucket.clone().unwrap_or_default(),
+                event_name: entry.event,
+                data: (*entry).clone(),
+            };
 
-                // Create EntityTarget for the audit log entry
-                let entity_target = EntityTarget {
-                    object_name: entry.api.name.clone().unwrap_or_default(),
-                    bucket_name: entry.api.bucket.clone().unwrap_or_default(),
-                    event_name: entry.event, // Default, should be derived from entry
-                    data: (*entry_clone).clone(),
-                };
+            let task = async move {
+                let result = target.save(Arc::new(entity_target)).await;
+                (target_key, result)
+            };
 
-                let task = async move {
-                    let result = target.save(Arc::new(entity_target)).await;
-                    (target_key_clone, result)
-                };
-
-                tasks.push(task);
-            }
+            tasks.push(task);
         }
 
         // Execute all dispatch tasks
@@ -359,39 +351,45 @@ impl AuditSystem {
         }
         drop(state);
 
-        let registry = self.registry.lock().await;
-        let target_keys = registry.list_targets();
+        // Collect targets under lock, then dispatch without holding it
+        let targets: Vec<(String, Box<dyn Target<AuditEntry> + Send + Sync>)> = {
+            let registry = self.registry.lock().await;
+            let target_keys = registry.list_targets();
 
-        if target_keys.is_empty() {
-            warn!("No audit targets configured for batch dispatch");
-            return Ok(());
-        }
+            if target_keys.is_empty() {
+                warn!("No audit targets configured for batch dispatch");
+                return Ok(());
+            }
+
+            target_keys
+                .into_iter()
+                .filter_map(|key| registry.get_target(&key).map(|t| (key, t.clone_dyn())))
+                .collect()
+        };
 
         let mut tasks = Vec::new();
-        for target_key in target_keys {
-            if let Some(target) = registry.get_target(&target_key) {
-                let entries_clone: Vec<_> = entries.iter().map(Arc::clone).collect();
-                let target_key_clone = target_key.clone();
+        for (target_key, target) in targets {
+            let entries_clone: Vec<_> = entries.iter().map(Arc::clone).collect();
+            let target_key_clone = target_key.clone();
 
-                let task = async move {
-                    let mut success_count = 0;
-                    let mut errors = Vec::new();
-                    for entry in entries_clone {
-                        let entity_target = EntityTarget {
-                            object_name: entry.api.name.clone().unwrap_or_default(),
-                            bucket_name: entry.api.bucket.clone().unwrap_or_default(),
-                            event_name: entry.event,
-                            data: (*entry).clone(),
-                        };
-                        match target.save(Arc::new(entity_target)).await {
-                            Ok(_) => success_count += 1,
-                            Err(e) => errors.push(e),
-                        }
+            let task = async move {
+                let mut success_count = 0;
+                let mut errors = Vec::new();
+                for entry in entries_clone {
+                    let entity_target = EntityTarget {
+                        object_name: entry.api.name.clone().unwrap_or_default(),
+                        bucket_name: entry.api.bucket.clone().unwrap_or_default(),
+                        event_name: entry.event,
+                        data: (*entry).clone(),
+                    };
+                    match target.save(Arc::new(entity_target)).await {
+                        Ok(_) => success_count += 1,
+                        Err(e) => errors.push(e),
                     }
-                    (target_key_clone, success_count, errors)
-                };
-                tasks.push(task);
-            }
+                }
+                (target_key_clone, success_count, errors)
+            };
+            tasks.push(task);
         }
 
         let results = futures::future::join_all(tasks).await;
@@ -417,6 +415,60 @@ impl AuditSystem {
         Ok(())
     }
 
+    /// Stops all active audit stream tasks by sending cancellation signals.
+    async fn stop_all_streams(&self) {
+        let mut cancellers = self.stream_cancellers.write().await;
+        for (target_id, cancel_tx) in cancellers.drain() {
+            info!(target_id = %target_id, "Stopping audit stream");
+            let _ = cancel_tx.send(()).await;
+        }
+    }
+
+    /// Initializes a single target: runs init(), starts stream if store is present,
+    /// and adds it to the registry. For store-backed targets, registration and stream
+    /// startup proceed even if init() fails so queued entries can be drained later.
+    async fn init_and_register_target(
+        &self,
+        target: Box<dyn Target<AuditEntry> + Send + Sync>,
+        registry: &mut AuditRegistry,
+    ) -> Option<String> {
+        let target_id = target.id().to_string();
+        let has_store = target.store().is_some();
+
+        if let Err(e) = target.init().await {
+            error!(target_id = %target_id, error = %e, "Failed to initialize audit target");
+            // Non-store targets: init failure is fatal.
+            if !has_store {
+                return None;
+            }
+            // Store-backed targets: still register and start the stream so queued
+            // entries can be drained when connectivity recovers.
+            warn!(
+                target_id = %target_id,
+                "Proceeding with store-backed audit target despite init failure"
+            );
+        }
+
+        if target.is_enabled() {
+            if let Some(store) = target.store() {
+                info!(target_id = %target_id, "Start audit stream processing for target");
+                let store_clone: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send> = store.boxed_clone();
+                let target_arc: Arc<dyn Target<AuditEntry> + Send + Sync> = Arc::from(target.clone_dyn());
+                let cancel_tx = self.start_audit_stream_with_batching(store_clone, target_arc);
+
+                self.stream_cancellers.write().await.insert(target_id.clone(), cancel_tx);
+                info!(target_id = %target_id, "Audit stream processing started");
+            } else {
+                info!(target_id = %target_id, "No store configured, skip audit stream processing");
+            }
+        } else {
+            info!(target_id = %target_id, "Target disabled, skip audit stream processing");
+        }
+
+        registry.add_target(target_id.clone(), target);
+        Some(target_id)
+    }
+
     /// Starts the audit stream processing for a target with batching and retry logic
     ///
     /// # Arguments
@@ -427,9 +479,10 @@ impl AuditSystem {
     /// and attempts to send them to the specified target. It implements retry logic with exponential backoff
     fn start_audit_stream_with_batching(
         &self,
-        store: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send>,
+        store: Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send>,
         target: Arc<dyn Target<AuditEntry> + Send + Sync>,
-    ) {
+    ) -> mpsc::Sender<()> {
+        let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
         let state = self.state.clone();
 
         tokio::spawn(async move {
@@ -442,6 +495,12 @@ impl AuditSystem {
             const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
 
             loop {
+                // Check for cancellation signal
+                if cancel_rx.try_recv().is_ok() {
+                    info!("Audit stream cancelled for target: {}", target.id());
+                    break;
+                }
+
                 match *state.read().await {
                     AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {}
                     _ => {
@@ -452,11 +511,22 @@ impl AuditSystem {
 
                 let keys: Vec<Key> = store.list();
                 if keys.is_empty() {
-                    sleep(Duration::from_millis(500)).await;
+                    tokio::select! {
+                        _ = sleep(Duration::from_millis(500)) => {},
+                        _ = cancel_rx.recv() => {
+                            info!("Audit stream cancelled during idle for target: {}", target.id());
+                            return;
+                        }
+                    }
                     continue;
                 }
 
                 for key in keys {
+                    if cancel_rx.try_recv().is_ok() {
+                        info!("Audit stream cancelled during processing for target: {}", target.id());
+                        return;
+                    }
+
                     let mut retries = 0usize;
                     let mut success = false;
 
@@ -475,8 +545,14 @@ impl AuditSystem {
                                     TargetError::Timeout(_) => {
                                         warn!("Timeout sending to target {}, retrying...", target.id());
                                     }
+                                    TargetError::Dropped(reason) => {
+                                        warn!("Dropped queued payload for target {}: {}", target.id(), reason);
+                                        observability::record_target_failure();
+                                        break;
+                                    }
                                     _ => {
                                         error!("Permanent error for target {}: {}", target.id(), e);
+                                        target.record_final_failure();
                                         observability::record_target_failure();
                                         break;
                                     }
@@ -490,6 +566,7 @@ impl AuditSystem {
 
                     if retries >= MAX_RETRIES && !success {
                         warn!("Max retries exceeded for key {}, target: {}, skipping", key.to_string(), target.id());
+                        target.record_final_failure();
                         observability::record_target_failure();
                     }
                 }
@@ -497,6 +574,8 @@ impl AuditSystem {
                 sleep(Duration::from_millis(100)).await;
             }
         });
+
+        cancel_tx
     }
 
     /// Enables a specific target
@@ -594,6 +673,31 @@ impl AuditSystem {
         registry.list_targets()
     }
 
+    /// Returns cloned target values for read-only runtime inspection.
+    pub async fn get_target_values(&self) -> Vec<Box<dyn Target<AuditEntry> + Send + Sync>> {
+        let registry = self.registry.lock().await;
+        registry.list_target_values()
+    }
+
+    /// Returns per-target delivery metrics for Prometheus collection.
+    pub async fn snapshot_target_metrics(&self) -> Vec<AuditTargetMetricSnapshot> {
+        let targets = self.get_target_values().await;
+        let mut snapshots = Vec::with_capacity(targets.len());
+
+        for target in targets {
+            let delivery = target.delivery_snapshot();
+            snapshots.push(AuditTargetMetricSnapshot {
+                failed_messages: delivery.failed_messages,
+                queue_length: delivery.queue_length,
+                target_id: target.id().to_string(),
+                total_messages: delivery.total_messages,
+            });
+        }
+
+        snapshots.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        snapshots
+    }
+
     /// Gets information about a specific target
     ///
     /// # Arguments
@@ -616,8 +720,10 @@ impl AuditSystem {
     pub async fn reload_config(&self, new_config: Config) -> AuditResult<()> {
         info!("Reloading audit system configuration");
 
-        // Record config reload
         observability::record_config_reload();
+
+        // Stop all existing stream tasks first
+        self.stop_all_streams().await;
 
         // Store new configuration
         {
@@ -636,28 +742,9 @@ impl AuditSystem {
             Ok(targets) => {
                 info!(target_count = targets.len(), "Reloaded audit targets successfully");
 
-                // Initialize all new targets
                 for target in targets {
-                    let target_id = target.id().to_string();
-                    if let Err(e) = target.init().await {
-                        error!(target_id = %target_id, error = %e, "Failed to initialize reloaded audit target");
-                    } else {
-                        // Same starts the storage stream after a heavy load
-                        if target.is_enabled() {
-                            if let Some(store) = target.store() {
-                                info!(target_id = %target_id, "Start audit stream processing for target (reload)");
-                                let store_clone: Box<dyn Store<EntityTarget<AuditEntry>, Error = StoreError, Key = Key> + Send> =
-                                    store.boxed_clone();
-                                let target_arc: Arc<dyn Target<AuditEntry> + Send + Sync> = Arc::from(target.clone_dyn());
-                                self.start_audit_stream_with_batching(store_clone, target_arc);
-                                info!(target_id = %target_id, "Audit stream processing started (reload)");
-                            } else {
-                                info!(target_id = %target_id, "No store configured, skip audit stream processing (reload)");
-                            }
-                        } else {
-                            info!(target_id = %target_id, "Target disabled, skip audit stream processing (reload)");
-                        }
-                        registry.add_target(target.id().to_string(), target);
+                    if let Some(target_id) = self.init_and_register_target(target, &mut registry).await {
+                        info!(target_id = %target_id, "Target initialized (reload)");
                     }
                 }
 

@@ -162,10 +162,8 @@ impl ListPathOptions {
                     }
 
                     match kv[0] {
-                        "rustfs_cache" => {
-                            if kv[1] != MARKER_TAG_VERSION {
-                                continue;
-                            }
+                        "rustfs_cache" if kv[1] != MARKER_TAG_VERSION => {
+                            continue;
                         }
                         "id" => self.id = Some(kv[1].to_owned()),
                         "return" => {
@@ -831,6 +829,7 @@ impl ECStore {
         let (merge_tx, mut merge_rx) = mpsc::channel::<MetaCacheEntry>(100);
 
         let bucket = bucket.to_owned();
+        let bucket_clone = bucket.clone();
 
         let vcf = match get_versioning_config(&bucket).await {
             Ok((res, _)) => Some(res),
@@ -841,7 +840,7 @@ impl ECStore {
             let mut sent_err = false;
             while let Some(entry) = merge_rx.recv().await {
                 if opts.latest_only {
-                    let fi = match entry.to_fileinfo(&bucket) {
+                    let fi = match entry.to_fileinfo(&bucket_clone) {
                         Ok(res) => res,
                         Err(err) => {
                             if !sent_err {
@@ -866,7 +865,7 @@ impl ECStore {
                     if let Some(filter) = opts.filter {
                         if filter(&fi) {
                             let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(&fi, &bucket, &fi.name, {
+                                item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
                                     if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
                                 })),
                                 err: None,
@@ -878,7 +877,7 @@ impl ECStore {
                         }
                     } else {
                         let item = ObjectInfoOrErr {
-                            item: Some(ObjectInfo::from_file_info(&fi, &bucket, &fi.name, {
+                            item: Some(ObjectInfo::from_file_info(&fi, &bucket_clone, &fi.name, {
                                 if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
                             })),
                             err: None,
@@ -891,7 +890,7 @@ impl ECStore {
                     continue;
                 }
 
-                let fvs = match entry.file_info_versions(&bucket) {
+                let fvs = match entry.file_info_versions(&bucket_clone) {
                     Ok(res) => res,
                     Err(err) => {
                         let item = ObjectInfoOrErr {
@@ -914,7 +913,7 @@ impl ECStore {
                     if let Some(filter) = opts.filter {
                         if filter(fi) {
                             let item = ObjectInfoOrErr {
-                                item: Some(ObjectInfo::from_file_info(fi, &bucket, &fi.name, {
+                                item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
                                     if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
                                 })),
                                 err: None,
@@ -926,7 +925,7 @@ impl ECStore {
                         }
                     } else {
                         let item = ObjectInfoOrErr {
-                            item: Some(ObjectInfo::from_file_info(fi, &bucket, &fi.name, {
+                            item: Some(ObjectInfo::from_file_info(fi, &bucket_clone, &fi.name, {
                                 if let Some(v) = &vcf { v.versioned(&fi.name) } else { false }
                             })),
                             err: None,
@@ -942,7 +941,18 @@ impl ECStore {
 
         tokio::spawn(async move { merge_entry_channels(rx, inputs, merge_tx, 1).await });
 
-        join_all(futures).await;
+        let walk_results = join_all(futures).await;
+        for (idx, walk_result) in walk_results.into_iter().enumerate() {
+            if let Err(err) = walk_result {
+                error!(
+                    bucket = %bucket,
+                    prefix = %prefix,
+                    set_task_index = idx,
+                    error = ?err,
+                    "walk_internal list_path_raw task failed"
+                );
+            }
+        }
 
         Ok(())
     }

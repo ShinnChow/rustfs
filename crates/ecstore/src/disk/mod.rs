@@ -19,6 +19,7 @@ pub mod error_conv;
 pub mod error_reduce;
 pub mod format;
 pub mod fs;
+pub mod health_state;
 pub mod local;
 pub mod os;
 
@@ -33,6 +34,7 @@ pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
 use crate::disk::disk_store::LocalDiskWrapper;
+use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
 use crate::rpc::RemoteDisk;
 use bytes::Bytes;
@@ -411,6 +413,30 @@ impl DiskAPI for Disk {
 }
 
 impl Disk {
+    pub fn runtime_state(&self) -> RuntimeDriveHealthState {
+        match self {
+            Disk::Local(local_disk) => local_disk.runtime_state(),
+            Disk::Remote(remote_disk) => remote_disk.runtime_state(),
+        }
+    }
+
+    pub fn offline_duration_secs(&self) -> Option<u64> {
+        match self {
+            Disk::Local(local_disk) => local_disk.offline_duration_secs(),
+            Disk::Remote(remote_disk) => remote_disk.offline_duration_secs(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
+        match self {
+            Disk::Local(local_disk) => local_disk.force_runtime_state_for_test(state),
+            Disk::Remote(remote_disk) => remote_disk.force_runtime_state_for_test(state),
+        }
+    }
+}
+
+impl Disk {
     /// Enable health monitoring on this disk.
     /// Called after startup format loading completes so that remote peers
     /// have time to come online before being marked as faulty.
@@ -570,6 +596,8 @@ pub struct DiskInfo {
     pub scanning: bool,
     pub endpoint: String,
     pub mount_path: String,
+    /// Leaf physical block devices backing this mount path when available.
+    pub physical_device_ids: Vec<String>,
     pub id: Option<Uuid>,
     pub rotational: bool,
     pub metrics: DiskMetrics,

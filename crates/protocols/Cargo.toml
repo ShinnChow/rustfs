@@ -53,7 +53,7 @@ swift = [
     "dep:base64",
     "dep:async-compression",
 ]
-webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls"]
+webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls", "dep:percent-encoding"]
 
 [dependencies]
 # Core RustFS dependencies
@@ -61,9 +61,10 @@ rustfs-iam = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-utils = { workspace = true }
+rustfs-config = { workspace = true }
 
 # Async dependencies
-tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time","io-uring"] }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 

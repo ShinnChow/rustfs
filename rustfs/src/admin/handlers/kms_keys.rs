@@ -170,7 +170,7 @@ impl Operation for CreateKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)], // TODO: Add specific KMS action
+            vec![Action::AdminAction(AdminAction::KMSCreateKeyAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -249,7 +249,7 @@ impl Operation for DescribeKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -320,6 +320,17 @@ mod tests {
 
         assert_eq!(extract_key_id(&uri).as_deref(), Some("legacy-key"));
     }
+    #[test]
+    fn test_extract_key_id_skips_empty_aliases() {
+        for (uri, expected) in [
+            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=minio-key", Some("minio-key")),
+            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=&key=fallback-key", Some("fallback-key")),
+            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=&key=", None),
+        ] {
+            let uri: Uri = uri.parse().expect("uri should parse");
+            assert_eq!(extract_key_id(&uri).as_deref(), expected);
+        }
+    }
 }
 
 /// List KMS keys (legacy endpoint)
@@ -340,7 +351,7 @@ impl Operation for ListKeysHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -468,7 +479,7 @@ impl Operation for CreateKmsKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            vec![Action::AdminAction(AdminAction::KMSCreateKeyAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -880,7 +891,7 @@ impl Operation for ListKmsKeysHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
@@ -992,7 +1003,7 @@ impl Operation for DescribeKmsKeyHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            vec![Action::AdminAction(AdminAction::KMSKeyStatusAdminAction)],
             req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;

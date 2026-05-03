@@ -34,8 +34,8 @@ use crate::global::get_global_bucket_monitor;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::store_api::{DeletedObject, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
 use aws_smithy_types::body::SdkBody;
@@ -85,7 +85,8 @@ use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
 
 pub(crate) const REPLICATION_DIR: &str = ".replication";
 pub(crate) const RESYNC_FILE_NAME: &str = "resync.bin";
@@ -108,6 +109,45 @@ fn normalize_wire_time(value: Option<OffsetDateTime>) -> Option<OffsetDateTime> 
         Some(v) if v == *WIRE_ZERO_TIME || v == OffsetDateTime::UNIX_EPOCH => None,
         other => other,
     }
+}
+
+fn resync_state_accepts_update(state: &TargetReplicationResyncStatus, opts: &ResyncOpts) -> bool {
+    state.resync_id.is_empty() || opts.resync_id.is_empty() || state.resync_id == opts.resync_id
+}
+
+fn should_count_head_proxy_failure(is_not_found: bool, code: Option<&str>, raw_status: Option<u16>) -> bool {
+    if is_not_found || matches!(code, Some("MethodNotAllowed" | "405")) {
+        return false;
+    }
+    !matches!(raw_status, Some(404 | 405))
+}
+
+fn is_head_proxy_failure(err: &SdkError<HeadObjectError>) -> bool {
+    let (is_not_found, code) = err
+        .as_service_error()
+        .map(|service_err| (service_err.is_not_found(), service_err.code()))
+        .unwrap_or((false, None));
+    let raw_status = err.raw_response().map(|resp| resp.status().as_u16());
+    should_count_head_proxy_failure(is_not_found, code, raw_status)
+}
+
+async fn record_proxy_request(bucket: &str, api: &str, is_err: bool) {
+    if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
+        stats.inc_proxy(bucket, api, is_err).await;
+    }
+}
+
+async fn head_object_with_proxy_stats(
+    source_bucket: &str,
+    target_client: &TargetClient,
+    target_bucket: &str,
+    object: &str,
+    version_id: Option<String>,
+) -> std::result::Result<HeadObjectOutput, SdkError<HeadObjectError>> {
+    let result = target_client.head_object(target_bucket, object, version_id).await;
+    let is_err = result.as_ref().err().is_some_and(is_head_proxy_failure);
+    record_proxy_request(source_bucket, "HeadObject", is_err).await;
+    result
 }
 
 #[derive(Debug, Clone, Default)]
@@ -360,16 +400,13 @@ static RESYNC_WORKER_COUNT: usize = 10;
 pub struct ReplicationResyncer {
     pub status_map: Arc<RwLock<HashMap<String, BucketReplicationResyncStatus>>>,
     pub worker_size: usize,
-    pub resync_cancel_tx: CancellationToken,
-    pub resync_cancel_rx: CancellationToken,
+    pub cancel_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
     pub worker_tx: tokio::sync::broadcast::Sender<()>,
     pub worker_rx: tokio::sync::broadcast::Receiver<()>,
 }
 
 impl ReplicationResyncer {
     pub async fn new() -> Self {
-        let resync_cancel_tx = CancellationToken::new();
-        let resync_cancel_rx = resync_cancel_tx.clone();
         let (worker_tx, worker_rx) = tokio::sync::broadcast::channel(RESYNC_WORKER_COUNT);
 
         for _ in 0..RESYNC_WORKER_COUNT {
@@ -381,16 +418,34 @@ impl ReplicationResyncer {
         Self {
             status_map: Arc::new(RwLock::new(HashMap::new())),
             worker_size: RESYNC_WORKER_COUNT,
-            resync_cancel_tx,
-            resync_cancel_rx,
+            cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             worker_tx,
             worker_rx,
+        }
+    }
+
+    fn cancel_key(opts: &ResyncOpts) -> String {
+        format!("{}:{}", opts.bucket, opts.arn)
+    }
+
+    pub async fn register_cancel_token(&self, opts: &ResyncOpts, token: CancellationToken) {
+        self.cancel_tokens.write().await.insert(Self::cancel_key(opts), token);
+    }
+
+    pub async fn clear_cancel_token(&self, opts: &ResyncOpts) {
+        self.cancel_tokens.write().await.remove(&Self::cancel_key(opts));
+    }
+
+    pub async fn cancel(&self, opts: &ResyncOpts) {
+        if let Some(token) = self.cancel_tokens.write().await.remove(&Self::cancel_key(opts)) {
+            token.cancel();
         }
     }
 
     pub async fn mark_status<S: StorageAPI>(&self, status: ResyncStatusType, opts: ResyncOpts, obj_layer: Arc<S>) -> Result<()> {
         let bucket_status = {
             let mut status_map = self.status_map.write().await;
+            let now = OffsetDateTime::now_utc();
 
             let bucket_status = if let Some(bucket_status) = status_map.get_mut(&opts.bucket) {
                 bucket_status
@@ -409,10 +464,33 @@ impl ReplicationResyncer {
                 bucket_status.targets_map.get_mut(&opts.arn).unwrap()
             };
 
-            state.resync_status = status;
-            state.last_update = Some(OffsetDateTime::now_utc());
+            if !resync_state_accepts_update(state, &opts) {
+                warn!(
+                    bucket = %opts.bucket,
+                    arn = %opts.arn,
+                    incoming_resync_id = %opts.resync_id,
+                    current_resync_id = %state.resync_id,
+                    "ignoring stale resync status update"
+                );
+                return Ok(());
+            }
 
-            bucket_status.last_update = Some(OffsetDateTime::now_utc());
+            if state.resync_id.is_empty() {
+                state.resync_id = opts.resync_id.clone();
+            }
+            if state.resync_before_date.is_none() {
+                state.resync_before_date = opts.resync_before;
+            }
+            if state.bucket.is_empty() {
+                state.bucket = opts.bucket.clone();
+            }
+            if status == ResyncStatusType::ResyncStarted && state.start_time.is_none() {
+                state.start_time = Some(now);
+            }
+            state.resync_status = status;
+            state.last_update = Some(now);
+
+            bucket_status.last_update = Some(now);
 
             bucket_status.clone()
         };
@@ -424,6 +502,7 @@ impl ReplicationResyncer {
 
     pub async fn inc_stats(&self, status: &TargetReplicationResyncStatus, opts: ResyncOpts) {
         let mut status_map = self.status_map.write().await;
+        let now = OffsetDateTime::now_utc();
 
         let bucket_status = if let Some(bucket_status) = status_map.get_mut(&opts.bucket) {
             bucket_status
@@ -442,13 +521,30 @@ impl ReplicationResyncer {
             bucket_status.targets_map.get_mut(&opts.arn).unwrap()
         };
 
+        if !resync_state_accepts_update(state, &opts) {
+            warn!(
+                bucket = %opts.bucket,
+                arn = %opts.arn,
+                incoming_resync_id = %opts.resync_id,
+                current_resync_id = %state.resync_id,
+                "ignoring stale resync stats update"
+            );
+            return;
+        }
+
+        if state.resync_id.is_empty() {
+            state.resync_id = opts.resync_id.clone();
+        }
+        if state.bucket.is_empty() {
+            state.bucket = opts.bucket.clone();
+        }
         state.object = status.object.clone();
         state.replicated_count += status.replicated_count;
         state.replicated_size += status.replicated_size;
         state.failed_count += status.failed_count;
         state.failed_size += status.failed_size;
-        state.last_update = Some(OffsetDateTime::now_utc());
-        bucket_status.last_update = Some(OffsetDateTime::now_utc());
+        state.last_update = Some(now);
+        bucket_status.last_update = Some(now);
     }
 
     pub async fn persist_to_disk<S: StorageAPI>(&self, cancel_token: CancellationToken, api: Arc<S>) {
@@ -640,7 +736,6 @@ impl ReplicationResyncer {
 
             let cancel_token = cancellation_token.clone();
             let target_client = target_client.clone();
-            let resync_cancel_rx = self.resync_cancel_rx.clone();
             let storage = storage.clone();
             let results_tx = results_tx.clone();
             let bucket_name = opts.bucket.clone();
@@ -688,10 +783,15 @@ impl ReplicationResyncer {
 
                     let reset_id = target_client.reset_id.clone();
 
-                    let (size, err) = if let Err(err) = target_client
-                        .head_object(&target_client.bucket, &roi.name, roi.version_id.map(|v| v.to_string()))
-                        .await
-                    {
+                    let head_result = head_object_with_proxy_stats(
+                        &bucket_name,
+                        target_client.as_ref(),
+                        &target_client.bucket,
+                        &roi.name,
+                        roi.version_id.map(|v| v.to_string()),
+                    )
+                    .await;
+                    let (size, err) = if let Err(err) = head_result {
                         if roi.delete_marker {
                             st.replicated_count += 1;
                         } else {
@@ -714,10 +814,6 @@ impl ReplicationResyncer {
                         err,
                     );
 
-                    if resync_cancel_rx.is_cancelled() {
-                        return;
-                    }
-
                     if cancel_token.is_cancelled() {
                         return;
                     }
@@ -731,8 +827,6 @@ impl ReplicationResyncer {
             futures.push(f);
         }
 
-        let resync_cancel_rx = self.resync_cancel_rx.clone();
-
         while let Some(res) = rx.recv().await {
             if let Some(err) = res.err {
                 error!("Failed to get object info: {}", err);
@@ -741,14 +835,8 @@ impl ReplicationResyncer {
                 return;
             }
 
-            if resync_cancel_rx.is_cancelled() {
-                self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
-                    .await;
-                return;
-            }
-
             if cancellation_token.is_cancelled() {
-                self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
                 return;
             }
@@ -770,14 +858,8 @@ impl ReplicationResyncer {
                 continue;
             }
 
-            if resync_cancel_rx.is_cancelled() {
-                self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
-                    .await;
-                return;
-            }
-
             if cancellation_token.is_cancelled() {
-                self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
+                self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
                 return;
             }
@@ -1230,15 +1312,7 @@ pub async fn check_replicate_delete(
         return ReplicateDecision::default();
     }
 
-    let opts = ObjectOpts {
-        name: dobj.object_name.clone(),
-        ssec: is_ssec_encrypted(&oi.user_defined),
-        user_tags: oi.user_tags.clone(),
-        delete_marker: oi.delete_marker,
-        version_id: dobj.version_id,
-        op_type: ReplicationType::Delete,
-        ..Default::default()
-    };
+    let opts = delete_replication_object_opts(dobj, oi);
 
     let tgt_arns = rcfg.filter_target_arns(&opts);
     let mut dsc = ReplicateDecision::new();
@@ -1288,6 +1362,19 @@ pub async fn check_replicate_delete(
     }
 
     dsc
+}
+
+fn delete_replication_object_opts(dobj: &ObjectToDelete, oi: &ObjectInfo) -> ObjectOpts {
+    ObjectOpts {
+        name: dobj.object_name.clone(),
+        ssec: is_ssec_encrypted(&oi.user_defined),
+        user_tags: oi.user_tags.clone(),
+        delete_marker: oi.delete_marker,
+        version_id: dobj.version_id,
+        op_type: ReplicationType::Delete,
+        replica: oi.replication_status == ReplicationStatusType::Replica,
+        ..Default::default()
+    }
 }
 
 /// Check if the user-defined metadata contains SSEC encryption headers
@@ -1456,6 +1543,54 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         }
     };
 
+    if dobj.delete_object.delete_marker
+        && let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id
+    {
+        let source_marker_state = storage
+            .get_object_info(
+                &bucket,
+                &dobj.delete_object.object_name,
+                &ObjectOptions {
+                    version_id: Some(delete_marker_version_id.to_string()),
+                    versioned: BucketVersioningSys::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                    version_suspended: BucketVersioningSys::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        match source_marker_state {
+            Ok(info) if info.delete_marker && info.version_id == Some(delete_marker_version_id) => {}
+            Ok(_) => {
+                warn!(
+                    bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = %delete_marker_version_id,
+                    "skipping stale delete-marker replication because source version is no longer a delete marker"
+                );
+                return;
+            }
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {
+                warn!(
+                    bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = %delete_marker_version_id,
+                    "skipping stale delete-marker replication because source version no longer exists"
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = %delete_marker_version_id,
+                    error = %err,
+                    "failed to verify source delete-marker state before replication"
+                );
+            }
+        }
+    }
+
     let dsc = match parse_replicate_decision(
         &bucket,
         &dobj
@@ -1488,7 +1623,6 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
             return;
         }
     };
-
     let ns_lock = match storage
         .new_ns_lock(&bucket, format!("/[replicate]/{}", dobj.delete_object.object_name).as_str())
         .await
@@ -1612,7 +1746,33 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
         }
     }
 
-    let (replication_status, prev_status) = if dobj.delete_object.version_id.is_none() {
+    let is_version_purge = is_version_delete_replication(&dobj.delete_object);
+
+    if should_retry_delete_marker_purge(&dobj.delete_object) {
+        let bucket_clone = bucket.clone();
+        let dobj_clone = dobj.clone();
+        let dsc_clone = dsc.clone();
+        let storage_clone = storage.clone();
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                if let Some(delete_marker_version_id) = dobj_clone.delete_object.delete_marker_version_id
+                    && source_delete_marker_missing(
+                        &*storage_clone,
+                        &bucket_clone,
+                        &dobj_clone.delete_object.object_name,
+                        delete_marker_version_id,
+                    )
+                    .await
+                {
+                    replicate_delete_marker_purge_to_targets(&bucket_clone, &dobj_clone, &dsc_clone).await;
+                    break;
+                }
+                tokio::time::sleep(TokioDuration::from_secs(1)).await;
+            }
+        });
+    }
+
+    let (replication_status, prev_status) = if !is_version_purge {
         (
             rinfos.replication_status(),
             dobj.delete_object
@@ -1697,6 +1857,65 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
                 ..Default::default()
             });
         }
+    }
+}
+
+async fn source_delete_marker_missing<S: StorageAPI>(
+    storage: &S,
+    bucket: &str,
+    object_name: &str,
+    delete_marker_version_id: Uuid,
+) -> bool {
+    match storage
+        .get_object_info(
+            bucket,
+            object_name,
+            &ObjectOptions {
+                version_id: Some(delete_marker_version_id.to_string()),
+                versioned: BucketVersioningSys::prefix_enabled(bucket, object_name).await,
+                version_suspended: BucketVersioningSys::prefix_suspended(bucket, object_name).await,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(info) => !info.delete_marker || info.version_id != Some(delete_marker_version_id),
+        Err(err) => is_err_object_not_found(&err) || is_err_version_not_found(&err),
+    }
+}
+
+async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedObjectReplicationInfo, dsc: &ReplicateDecision) {
+    let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id else {
+        return;
+    };
+
+    for tgt_entry in dsc.targets_map.values() {
+        if !tgt_entry.replicate {
+            continue;
+        }
+        if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
+            continue;
+        }
+        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(bucket, &tgt_entry.arn).await else {
+            continue;
+        };
+
+        let _ = tgt_client
+            .remove_object(
+                &tgt_client.bucket,
+                &dobj.delete_object.object_name,
+                Some(delete_marker_version_id.to_string()),
+                RemoveObjectOptions {
+                    force_delete: false,
+                    governance_bypass: false,
+                    replication_delete_marker: false,
+                    replication_mtime: dobj.delete_object.delete_marker_mtime,
+                    replication_status: ReplicationStatusType::Replica,
+                    replication_request: true,
+                    replication_validity_check: false,
+                },
+            )
+            .await;
     }
 }
 
@@ -1883,6 +2102,18 @@ async fn replicate_force_delete_to_targets<S: StorageAPI>(dobj: &DeletedObjectRe
     }
 }
 
+fn is_version_delete_replication(dobj: &DeletedObject) -> bool {
+    dobj.version_id.is_some() || (dobj.delete_marker_version_id.is_some() && !dobj.delete_marker)
+}
+
+fn should_retry_delete_marker_purge(dobj: &DeletedObject) -> bool {
+    dobj.delete_marker_version_id.is_some()
+}
+
+fn is_retryable_delete_replication_head_error(is_not_found: bool, code: Option<&str>) -> bool {
+    !is_not_found && !matches!(code, Some("MethodNotAllowed" | "405"))
+}
+
 async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         version_id.to_owned()
@@ -1900,7 +2131,8 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     rinfo.endpoint = tgt_client.endpoint.clone();
     rinfo.secure = tgt_client.secure;
 
-    if dobj.delete_object.version_id.is_none()
+    let is_version_purge = is_version_delete_replication(&dobj.delete_object);
+    if !is_version_purge
         && rinfo.prev_replication_status == ReplicationStatusType::Completed
         && dobj.op_type != ReplicationType::ExistingObject
     {
@@ -1908,12 +2140,12 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    if dobj.delete_object.version_id.is_some() && rinfo.version_purge_status == VersionPurgeStatusType::Complete {
+    if is_version_purge && rinfo.version_purge_status == VersionPurgeStatusType::Complete {
         return rinfo;
     }
 
     if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
-        if dobj.delete_object.version_id.is_none() {
+        if !is_version_purge {
             rinfo.replication_status = ReplicationStatusType::Failed;
         } else {
             rinfo.version_purge_status = VersionPurgeStatusType::Failed;
@@ -1927,18 +2159,34 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         Some(version_id.to_string())
     };
 
-    if dobj.delete_object.delete_marker_version_id.is_some()
-        && let Err(e) = tgt_client
-            .head_object(&tgt_client.bucket, &dobj.delete_object.object_name, version_id.clone())
-            .await
-        && let SdkError::ServiceError(service_err) = &e
-        && !service_err.err().is_not_found()
-    {
-        rinfo.replication_status = ReplicationStatusType::Failed;
-        rinfo.error = Some(e.to_string());
-
-        return rinfo;
-    };
+    if dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
+        match head_object_with_proxy_stats(
+            &dobj.bucket,
+            tgt_client.as_ref(),
+            &tgt_client.bucket,
+            &dobj.delete_object.object_name,
+            version_id.clone(),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                let non_retryable = matches!(
+                    &e,
+                    SdkError::ServiceError(service_err)
+                        if is_retryable_delete_replication_head_error(
+                            service_err.err().is_not_found(),
+                            service_err.err().code(),
+                        )
+                );
+                if non_retryable {
+                    rinfo.replication_status = ReplicationStatusType::Failed;
+                    rinfo.error = Some(e.to_string());
+                    return rinfo;
+                }
+            }
+        }
+    }
 
     match tgt_client
         .remove_object(
@@ -1948,7 +2196,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             RemoveObjectOptions {
                 force_delete: false,
                 governance_bypass: false,
-                replication_delete_marker: dobj.delete_object.delete_marker_version_id.is_some(),
+                replication_delete_marker: dobj.delete_object.delete_marker,
                 replication_mtime: dobj.delete_object.delete_marker_mtime,
                 replication_status: ReplicationStatusType::Replica,
                 replication_request: true,
@@ -1958,15 +2206,32 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         .await
     {
         Ok(_) => {
-            if dobj.delete_object.version_id.is_none() {
+            debug!(
+                bucket = tgt_client.bucket,
+                object = dobj.delete_object.object_name,
+                version_id = ?version_id,
+                delete_marker = dobj.delete_object.delete_marker,
+                is_version_purge,
+                "replicate_delete_to_target succeeded"
+            );
+            if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Completed;
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Complete;
             }
         }
         Err(e) => {
+            warn!(
+                bucket = tgt_client.bucket,
+                object = dobj.delete_object.object_name,
+                version_id = ?version_id,
+                delete_marker = dobj.delete_object.delete_marker,
+                is_version_purge,
+                error = %e,
+                "replicate_delete_to_target failed"
+            );
             rinfo.error = Some(e.to_string());
-            if dobj.delete_object.version_id.is_none() {
+            if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Failed;
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Failed;
@@ -2251,9 +2516,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         }
 
         let mut replication_action = replication_action;
-        match tgt_client
-            .head_object(&tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))
-            .await
+        match head_object_with_proxy_stats(
+            &bucket,
+            tgt_client.as_ref(),
+            &tgt_client.bucket,
+            &object,
+            self.version_id.map(|v| v.to_string()),
+        )
+        .await
         {
             Ok(oi) => {
                 replication_action = get_replication_action(&object_info, &oi, self.op_type);
@@ -2308,9 +2578,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
+        let has_tagging_replication = !put_opts.user_tags.is_empty();
         if let Some(err) = if is_multipart {
             drop(gr);
-            replicate_object_with_multipart(MultipartReplicationContext {
+            let result = replicate_object_with_multipart(MultipartReplicationContext {
                 storage: storage.clone(),
                 cli: tgt_client.clone(),
                 src_bucket: &bucket,
@@ -2321,16 +2592,24 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 arn: &rinfo.arn,
                 put_opts,
             })
-            .await
-            .err()
+            .await;
+            record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+            if has_tagging_replication {
+                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+            }
+            result.err()
         } else {
             gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
             let byte_stream = async_read_to_bytestream(gr.stream);
-            tgt_client
+            let result = tgt_client
                 .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
                 .await
-                .map_err(|e| std::io::Error::other(e.to_string()))
-                .err()
+                .map_err(|e| std::io::Error::other(e.to_string()));
+            record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+            if has_tagging_replication {
+                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+            }
+            result.err()
         } {
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(err.to_string());
@@ -2470,9 +2749,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             warn!("failed to set replication tagging directive header: {err}");
         }
 
-        match tgt_client
-            .head_object(&tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))
-            .await
+        match head_object_with_proxy_stats(
+            &bucket,
+            tgt_client.as_ref(),
+            &tgt_client.bucket,
+            &object,
+            self.version_id.map(|v| v.to_string()),
+        )
+        .await
         {
             Ok(oi) => {
                 replication_action = get_replication_action(&object_info, &oi, self.op_type);
@@ -2590,9 +2874,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             };
 
+            let has_tagging_replication = !put_opts.user_tags.is_empty();
             if let Some(err) = if is_multipart {
                 drop(gr);
-                replicate_object_with_multipart(MultipartReplicationContext {
+                let result = replicate_object_with_multipart(MultipartReplicationContext {
                     storage: storage.clone(),
                     cli: tgt_client.clone(),
                     src_bucket: &bucket,
@@ -2603,16 +2888,24 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     arn: &rinfo.arn,
                     put_opts,
                 })
-                .await
-                .err()
+                .await;
+                record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+                if has_tagging_replication {
+                    record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+                }
+                result.err()
             } else {
                 gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
                 let byte_stream = async_read_to_bytestream(gr.stream);
-                tgt_client
+                let result = tgt_client
                     .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
                     .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-                    .err()
+                    .map_err(|e| std::io::Error::other(e.to_string()));
+                record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+                if has_tagging_replication {
+                    record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+                }
+                result.err()
             } {
                 rinfo.replication_status = ReplicationStatusType::Failed;
                 rinfo.error = Some(err.to_string());
@@ -3409,6 +3702,153 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_delete_replication_object_opts_marks_replica_deletes() {
+        let dobj = ObjectToDelete {
+            object_name: "obj".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+
+        let opts = delete_replication_object_opts(&dobj, &oi);
+
+        assert!(
+            opts.replica,
+            "replica deletes must preserve replica status for downstream ReplicaModifications rules"
+        );
+        assert_eq!(opts.version_id, dobj.version_id);
+        assert_eq!(opts.name, dobj.object_name);
+        assert_eq!(opts.op_type, ReplicationType::Delete);
+    }
+
+    #[test]
+    fn test_delete_replication_object_opts_keeps_non_replica_deletes_local() {
+        let dobj = ObjectToDelete {
+            object_name: "obj".to_string(),
+            ..Default::default()
+        };
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+
+        let opts = delete_replication_object_opts(&dobj, &oi);
+
+        assert!(!opts.replica, "source-originated deletes should not be treated as replica modifications");
+    }
+
+    #[test]
+    fn test_is_version_delete_replication_for_delete_marker_version_purge() {
+        let dobj = DeletedObject {
+            delete_marker: false,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            is_version_delete_replication(&dobj),
+            "delete-marker version purges must be tracked as version purge replication, not delete-marker creation replication"
+        );
+    }
+
+    #[test]
+    fn test_is_version_delete_replication_for_delete_marker_creation() {
+        let dobj = DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            !is_version_delete_replication(&dobj),
+            "delete-marker creation should remain on the delete-marker replication path"
+        );
+    }
+
+    #[test]
+    fn test_should_retry_delete_marker_purge_for_version_purge() {
+        let dobj = DeletedObject {
+            delete_marker: false,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            should_retry_delete_marker_purge(&dobj),
+            "delete-marker version purge should schedule delayed target cleanup in case the target marker arrives late"
+        );
+    }
+
+    #[test]
+    fn test_should_retry_delete_marker_purge_for_delete_marker_creation() {
+        let dobj = DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            should_retry_delete_marker_purge(&dobj),
+            "delete-marker creation should keep the late-arrival cleanup path so downstream purges can catch up"
+        );
+    }
+
+    #[test]
+    fn test_is_retryable_delete_replication_head_error_allows_delete_marker_head_responses() {
+        assert!(
+            !is_retryable_delete_replication_head_error(false, Some("405")),
+            "numeric 405 responses should not block delete-marker purge replication"
+        );
+        assert!(
+            !is_retryable_delete_replication_head_error(false, Some("MethodNotAllowed")),
+            "MethodNotAllowed responses should not block delete-marker purge replication"
+        );
+        assert!(
+            !is_retryable_delete_replication_head_error(true, Some("NoSuchKey")),
+            "not-found responses should not block delete-marker purge replication"
+        );
+        assert!(
+            is_retryable_delete_replication_head_error(false, Some("AccessDenied")),
+            "unexpected head errors should still fail fast"
+        );
+    }
+
+    #[test]
+    fn test_should_count_head_proxy_failure_ignores_not_found_and_405() {
+        assert!(
+            !should_count_head_proxy_failure(true, Some("NoSuchKey"), Some(404)),
+            "not-found heads are expected when the object has not reached the target yet"
+        );
+        assert!(
+            !should_count_head_proxy_failure(false, Some("MethodNotAllowed"), Some(405)),
+            "405 delete-marker probing responses should not be counted as proxy failures"
+        );
+        assert!(
+            !should_count_head_proxy_failure(false, Some("405"), Some(405)),
+            "numeric 405 codes must align with MethodNotAllowed semantics"
+        );
+    }
+
+    #[test]
+    fn test_should_count_head_proxy_failure_counts_unexpected_errors() {
+        assert!(
+            should_count_head_proxy_failure(false, Some("AccessDenied"), Some(403)),
+            "non-NotFound and non-405 service errors should be counted as failures"
+        );
+        assert!(
+            should_count_head_proxy_failure(false, None, Some(500)),
+            "raw 5xx head responses should be counted as proxy failures"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_heal_replicate_object_info_failed_object_returns_heal_roi() {
         let oi = ObjectInfo {
@@ -3429,5 +3869,55 @@ mod tests {
             roi.dsc.replicate_any() || roi.dsc.targets_map.is_empty(),
             "With no replication config, dsc may be empty; with config, replicate_any() would be true and queueing would occur"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_marks_only_matching_bucket_target_token() {
+        let resyncer = ReplicationResyncer::new().await;
+        let opts_a = ResyncOpts {
+            bucket: "bucket-a".to_string(),
+            arn: "arn:replication::a".to_string(),
+            resync_id: "rid-a".to_string(),
+            resync_before: None,
+        };
+        let opts_b = ResyncOpts {
+            bucket: "bucket-b".to_string(),
+            arn: "arn:replication::b".to_string(),
+            resync_id: "rid-b".to_string(),
+            resync_before: None,
+        };
+        let token_a = CancellationToken::new();
+        let token_b = CancellationToken::new();
+        resyncer.register_cancel_token(&opts_a, token_a.clone()).await;
+        resyncer.register_cancel_token(&opts_b, token_b.clone()).await;
+
+        resyncer.cancel(&opts_a).await;
+
+        assert!(token_a.is_cancelled());
+        assert!(!token_b.is_cancelled());
+    }
+
+    #[test]
+    fn test_resync_state_accepts_update_only_for_matching_run() {
+        let current = TargetReplicationResyncStatus {
+            resync_id: "run-new".to_string(),
+            ..Default::default()
+        };
+        let matching = ResyncOpts {
+            bucket: "bucket".to_string(),
+            arn: "arn:replication::dest".to_string(),
+            resync_id: "run-new".to_string(),
+            resync_before: None,
+        };
+        let stale = ResyncOpts {
+            bucket: "bucket".to_string(),
+            arn: "arn:replication::dest".to_string(),
+            resync_id: "run-old".to_string(),
+            resync_before: None,
+        };
+
+        assert!(resync_state_accepts_update(&TargetReplicationResyncStatus::default(), &matching));
+        assert!(resync_state_accepts_update(&current, &matching));
+        assert!(!resync_state_accepts_update(&current, &stale));
     }
 }

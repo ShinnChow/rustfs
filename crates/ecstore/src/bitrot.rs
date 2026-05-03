@@ -64,7 +64,7 @@ pub async fn create_bitrot_reader(
         Ok(Some(reader))
     } else if let Some(disk) = disk {
         // Read from disk
-        if use_zero_copy {
+        if use_zero_copy && disk.is_local() {
             // Try zero-copy read first (uses mmap on Unix)
             let start = Instant::now();
             match disk.read_file_zero_copy(bucket, path, offset, length).await {
@@ -224,6 +224,52 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_create_bitrot_reader_with_inline_offset_starts_at_requested_shard() {
+        let shard_size = 4;
+        let checksum_algo = HashAlgorithm::HighwayHash256S;
+        let payload = b"abcdefghijkl";
+
+        let mut writer = create_bitrot_writer(
+            true,
+            None,
+            "test-volume",
+            "test-path",
+            payload.len() as i64,
+            shard_size,
+            checksum_algo.clone(),
+        )
+        .await
+        .expect("inline bitrot writer");
+
+        for chunk in payload.chunks(shard_size) {
+            writer.write(chunk).await.expect("write chunk");
+        }
+
+        let inline_data = writer.into_inline_data().expect("inline buffer");
+        let mut reader = create_bitrot_reader(
+            Some(&inline_data),
+            None,
+            "test-bucket",
+            "test-path",
+            shard_size,
+            shard_size,
+            shard_size,
+            checksum_algo,
+            false,
+            false,
+        )
+        .await
+        .expect("create reader")
+        .expect("reader");
+
+        let mut out = [0u8; 4];
+        let n = reader.read(&mut out).await.expect("read second shard");
+
+        assert_eq!(n, shard_size);
+        assert_eq!(&out[..n], b"efgh");
     }
 
     #[tokio::test]

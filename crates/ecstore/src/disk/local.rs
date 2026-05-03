@@ -17,9 +17,9 @@ use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts,
-    VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
@@ -31,6 +31,7 @@ use crate::disk::{
 use crate::erasure_coding::bitrot_verify;
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use bytes::Bytes;
+use metrics::counter;
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
@@ -61,6 +62,10 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
+const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
+
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
     pub id: Option<Uuid>,
@@ -73,6 +78,238 @@ pub struct FormatInfo {
 pub enum InternalBuf<'a> {
     Ref(&'a [u8]),
     Owned(Bytes),
+}
+
+struct FileCacheReclaimWriter {
+    inner: File,
+    reclaim_len: usize,
+    reclaim_on_shutdown: bool,
+    reclaimed: bool,
+}
+
+struct FileCacheReclaimReader {
+    inner: File,
+    reclaim_offset: u64,
+    reclaim_len: usize,
+    reclaim_on_drop: bool,
+    reclaimed: bool,
+}
+
+fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, started: std::time::Instant) {
+    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "ok".to_string()).increment(1);
+    counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => kind.to_string()).increment(reclaim_len as u64);
+    metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => kind.to_string())
+        .record(started.elapsed().as_secs_f64());
+}
+
+fn record_file_cache_reclaim_error(kind: &'static str) {
+    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "err".to_string()).increment(1);
+}
+
+impl FileCacheReclaimReader {
+    fn new(inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool) -> Self {
+        #[cfg(target_os = "macos")]
+        if reclaim_on_drop {
+            let _ = set_fd_nocache(&inner);
+        }
+
+        Self {
+            inner,
+            reclaim_offset,
+            reclaim_len,
+            reclaim_on_drop,
+            reclaimed: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        use core::num::NonZeroU64;
+        use rustix::fs::{Advice, fadvise};
+
+        if !self.reclaim_on_drop || self.reclaimed || self.reclaim_len == 0 {
+            return Ok(());
+        }
+
+        let started = std::time::Instant::now();
+        let reclaim_len =
+            NonZeroU64::new(self.reclaim_len as u64).expect("reclaim_len is guaranteed non-zero by the early return");
+        fadvise(&self.inner, self.reclaim_offset, Some(reclaim_len), Advice::DontNeed).map_err(std::io::Error::from)?;
+
+        self.reclaimed = true;
+        record_file_cache_reclaim_success("read", self.reclaim_len, started);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn set_fd_nocache(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `fcntl` is called on a valid file descriptor owned by `file`.
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    if ret == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn set_std_fd_nocache(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `fcntl` is called on a valid file descriptor owned by `file`.
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    if ret == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+impl Drop for FileCacheReclaimReader {
+    fn drop(&mut self) {
+        if let Err(err) = self.reclaim_file_cache() {
+            record_file_cache_reclaim_error("read");
+            debug!(error = ?err, reclaim_offset = self.reclaim_offset, reclaim_len = self.reclaim_len, "failed to reclaim file cache after read");
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for FileCacheReclaimReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl FileCacheReclaimWriter {
+    fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+        #[cfg(target_os = "macos")]
+        if reclaim_on_shutdown {
+            let _ = set_fd_nocache(&inner);
+        }
+
+        Self {
+            inner,
+            reclaim_len,
+            reclaim_on_shutdown,
+            reclaimed: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        use core::num::NonZeroU64;
+        use rustix::fs::{Advice, fadvise};
+
+        if !self.reclaim_on_shutdown || self.reclaimed || self.reclaim_len == 0 {
+            return Ok(());
+        }
+
+        let started = std::time::Instant::now();
+        let reclaim_len =
+            NonZeroU64::new(self.reclaim_len as u64).expect("reclaim_len is guaranteed non-zero by the early return");
+        fadvise(&self.inner, 0, Some(reclaim_len), Advice::DontNeed).map_err(std::io::Error::from)?;
+
+        self.reclaimed = true;
+        record_file_cache_reclaim_success("write", self.reclaim_len, started);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AsyncWrite for FileCacheReclaimWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match std::pin::Pin::new(&mut self.inner).poll_shutdown(cx) {
+            std::task::Poll::Ready(Ok(())) => {
+                if let Err(err) = self.reclaim_file_cache() {
+                    record_file_cache_reclaim_error("write");
+                    debug!(error = ?err, reclaim_len = self.reclaim_len, "failed to reclaim file cache after write");
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+fn should_reclaim_file_cache_after_write(file_size: i64) -> bool {
+    if file_size <= 0 {
+        return false;
+    }
+
+    if !rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
+    ) {
+        return false;
+    }
+
+    let threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+    );
+    file_size as usize >= threshold
+}
+
+fn should_reclaim_file_cache_after_read(length: usize) -> bool {
+    if length == 0 {
+        return false;
+    }
+
+    if !rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
+    ) {
+        return false;
+    }
+
+    let threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+    );
+    length >= threshold
 }
 
 pub struct LocalDisk {
@@ -133,8 +370,8 @@ impl LocalDisk {
 
         ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
 
-        if cleanup {
-            // TODO: remove temporary data
+        if cleanup && let Err(err) = Self::cleanup_tmp_on_startup(&root).await {
+            warn!(root = ?root, error = ?err, "failed to cleanup temporary data during disk startup");
         }
 
         // Use optimized path resolution instead of absolutize_virtually
@@ -172,7 +409,15 @@ impl LocalDisk {
             let root = root_clone.clone();
             Box::pin(async move {
                 match get_disk_info(root.clone()).await {
-                    Ok((info, root)) => {
+                    Ok((info, is_root_disk)) => {
+                        let physical_device_ids = match rustfs_utils::os::get_physical_device_ids(root.to_string_lossy().as_ref())
+                        {
+                            Ok(ids) => ids,
+                            Err(err) => {
+                                warn!(root = ?root, error = ?err, "failed to resolve physical device ids for disk root");
+                                Vec::new()
+                            }
+                        };
                         let disk_info = DiskInfo {
                             total: info.total,
                             free: info.free,
@@ -182,7 +427,8 @@ impl LocalDisk {
                             major: info.major,
                             minor: info.minor,
                             fs_type: info.fstype,
-                            root_disk: root,
+                            root_disk: is_root_disk,
+                            physical_device_ids,
                             id: disk_id,
                             ..Default::default()
                         };
@@ -251,12 +497,15 @@ impl LocalDisk {
     }
 
     async fn cleanup_deleted_objects_loop(root: PathBuf, mut exit_rx: tokio::sync::broadcast::Receiver<()>) {
-        let mut interval = interval(Duration::from_secs(60 * 5));
+        let mut interval = interval(DELETED_OBJECTS_CLEANUP_INTERVAL);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(err) = Self::cleanup_deleted_objects(root.clone()).await {
                         error!("cleanup_deleted_objects error: {:?}", err);
+                    }
+                    if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone()).await {
+                        error!("cleanup_stale_tmp_objects error: {:?}", err);
                     }
                 }
                 _ = exit_rx.recv() => {
@@ -267,13 +516,83 @@ impl LocalDisk {
         }
     }
 
-    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+    fn meta_path(root: &Path, meta_path: &str) -> PathBuf {
         #[cfg(windows)]
-        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.replace('/', "\\");
+        let meta_path = meta_path.replace('/', "\\");
         #[cfg(not(windows))]
-        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.to_string();
+        let meta_path = meta_path.to_string();
 
-        let trash = root.join(trash_path);
+        root.join(meta_path)
+    }
+
+    async fn cleanup_tmp_on_startup(root: &Path) -> Result<()> {
+        let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
+        let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
+
+        rename_all(&tmp_path, &tmp_old_path, root).await?;
+
+        let tmp_old_root = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET);
+        tokio::spawn(async move {
+            if let Err(err) = tokio::fs::remove_dir_all(&tmp_old_root).await
+                && err.kind() != ErrorKind::NotFound
+            {
+                warn!(path = ?tmp_old_root, error = ?err, "failed to remove old temporary data");
+            }
+        });
+
+        tokio::fs::create_dir_all(Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET)).await?;
+        Ok(())
+    }
+
+    async fn cleanup_stale_tmp_objects(root: PathBuf) -> Result<()> {
+        Self::cleanup_stale_tmp_objects_with_expiry(root, STALE_TMP_OBJECT_EXPIRY).await
+    }
+
+    async fn cleanup_stale_tmp_objects_with_expiry(root: PathBuf, expiry: Duration) -> Result<()> {
+        let tmp_path = Self::meta_path(&root, RUSTFS_META_TMP_BUCKET);
+        let mut entries = match fs::read_dir(&tmp_path).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() == ErrorKind::NotFound {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() || name == "." || name == ".." || name == ".trash" {
+                continue;
+            }
+
+            let file_type = entry.file_type().await?;
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let Some(age) = entry
+                .metadata()
+                .await?
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+            else {
+                continue;
+            };
+            if age <= expiry {
+                continue;
+            }
+
+            let target_path = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
+            rename_all(entry.path(), target_path, Self::meta_path(&root, RUSTFS_META_BUCKET)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+        let trash = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET);
         let mut entries = match fs::read_dir(&trash).await {
             Ok(entries) => entries,
             Err(e) => {
@@ -1061,6 +1380,16 @@ impl LocalDisk {
         }
 
         let mut dir_stack: Vec<(String, bool)> = Vec::with_capacity(5);
+        // Explicit directory markers and real directories can resolve to the same logical path.
+        let schedule_dir = |dir_stack: &mut Vec<(String, bool)>, dir_name: String, skip_object: bool| {
+            if let Some((last_dir_name, existing_skip_object)) = dir_stack.last_mut()
+                && *last_dir_name == dir_name
+            {
+                *existing_skip_object |= skip_object;
+            } else {
+                dir_stack.push((dir_name, skip_object));
+            }
+        };
         prefix = "".to_owned();
 
         for entry in entries.iter() {
@@ -1129,7 +1458,7 @@ impl LocalDisk {
                         if !dir_name.ends_with(SLASH_SEPARATOR) {
                             dir_name.push_str(SLASH_SEPARATOR);
                         }
-                        dir_stack.push((dir_name, true));
+                        schedule_dir(&mut dir_stack, dir_name, true);
                     }
                 }
                 Err(err) => {
@@ -1138,7 +1467,7 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            dir_stack.push((meta.name, false));
+                            schedule_dir(&mut dir_stack, meta.name, false);
                         }
                     }
 
@@ -1451,7 +1780,7 @@ impl DiskAPI for LocalDisk {
                 volume,
                 path_join_buf(&[
                     path,
-                    &fi.data_dir.map_or("".to_string(), |dir| dir.to_string()),
+                    &fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()),
                     &format!("part.{}", part.number),
                 ])
                 .as_str(),
@@ -1500,7 +1829,7 @@ impl DiskAPI for LocalDisk {
                 self.get_object_path(
                     bucket,
                     path_join_buf(&[
-                        path.parent().unwrap_or(Path::new("")).to_string_lossy().as_ref(),
+                        path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy().as_ref(),
                         &format!("part.{num}"),
                     ])
                     .as_str(),
@@ -1561,7 +1890,7 @@ impl DiskAPI for LocalDisk {
                 volume,
                 path_join_buf(&[
                     path,
-                    &fi.data_dir.map_or("".to_string(), |dir| dir.to_string()),
+                    &fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()),
                     &format!("part.{}", part.number),
                 ])
                 .as_str(),
@@ -1751,8 +2080,9 @@ impl DiskAPI for LocalDisk {
         let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY)
             .await
             .map_err(to_file_error)?;
+        let reclaim_on_shutdown = should_reclaim_file_cache_after_write(_file_size);
 
-        Ok(Box::new(f))
+        Ok(Box::new(FileCacheReclaimWriter::new(f, _file_size.max(0) as usize, reclaim_on_shutdown)))
 
         // Ok(())
     }
@@ -1824,7 +2154,8 @@ impl DiskAPI for LocalDisk {
             f.seek(SeekFrom::Start(offset as u64)).await?;
         }
 
-        Ok(Box::new(f))
+        let reclaim_on_drop = should_reclaim_file_cache_after_read(length);
+        Ok(Box::new(FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop)))
     }
 
     /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
@@ -1868,20 +2199,58 @@ impl DiskAPI for LocalDisk {
         {
             use memmap2::MmapOptions;
             let file_path_clone = file_path.clone();
-            let offset_u64 = offset as u64;
 
+            let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
             let bytes = tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
 
-                // Create memory map for the specified region
-                // SAFETY: The file is opened as read-only, and we're mapping a region
-                // that we've already verified exists and is within file bounds.
-                let mmap = unsafe { MmapOptions::new().offset(offset_u64).len(length).map(&file) }.map_err(DiskError::other)?;
+                #[cfg(target_os = "macos")]
+                if should_reclaim_after_read {
+                    let _ = set_std_fd_nocache(&file);
+                }
 
-                // Copy the mapped region into a Bytes buffer. This avoids undefined
-                // behavior from treating OS-managed mmap memory as allocator-managed
-                // Vec storage, at the cost of an extra copy.
-                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap))
+                // mmap offsets on Unix must be page-size aligned. Align the
+                // mapping down to the nearest page boundary, then slice out the
+                // originally requested logical range.
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if page_size <= 0 {
+                    return Err(DiskError::other("failed to determine system page size"));
+                }
+                let page_size = page_size as u64;
+                let offset_u64 = offset as u64;
+                let aligned_offset = offset_u64 - (offset_u64 % page_size);
+                let logical_offset = (offset_u64 - aligned_offset) as usize;
+                let map_len = logical_offset
+                    .checked_add(length)
+                    .ok_or_else(|| DiskError::other("mmap length overflow"))?;
+
+                // SAFETY: The file is opened as read-only, and we're mapping a region
+                // that we've already verified exists and is within file bounds. The
+                // file offset passed to mmap is page-size aligned as required on Unix.
+                let mmap =
+                    unsafe { MmapOptions::new().offset(aligned_offset).len(map_len).map(&file) }.map_err(DiskError::other)?;
+
+                // Copy only the requested logical range into a Bytes buffer. This
+                // avoids undefined behavior from treating OS-managed mmap memory as
+                // allocator-managed Vec storage, at the cost of an extra copy.
+                let end = logical_offset
+                    .checked_add(length)
+                    .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
+                let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
+
+                #[cfg(target_os = "linux")]
+                if should_reclaim_after_read {
+                    use core::num::NonZeroU64;
+                    use rustix::fs::{Advice, fadvise};
+
+                    let reclaim_len =
+                        NonZeroU64::new(map_len as u64).ok_or_else(|| DiskError::other("mmap reclaim length overflow"))?;
+                    fadvise(&file, aligned_offset, Some(reclaim_len), Advice::DontNeed)
+                        .map_err(std::io::Error::from)
+                        .map_err(DiskError::from)?;
+                }
+
+                Ok::<Bytes, DiskError>(bytes)
             })
             .await
             .map_err(DiskError::from)??;
@@ -1967,6 +2336,7 @@ impl DiskAPI for LocalDisk {
 
         let mut objs_returned = 0;
 
+        let mut skip_current_dir_object = false;
         if opts.base_dir.ends_with(SLASH_SEPARATOR) {
             if let Ok(data) = self
                 .read_metadata(
@@ -1993,7 +2363,7 @@ impl DiskAPI for LocalDisk {
                 if let Ok(meta) = tokio::fs::metadata(fpath).await
                     && meta.is_file()
                 {
-                    return Err(DiskError::FileNotFound);
+                    skip_current_dir_object = true;
                 }
             }
         }
@@ -2004,7 +2374,7 @@ impl DiskAPI for LocalDisk {
             &opts,
             &mut out,
             &mut objs_returned,
-            false,
+            skip_current_dir_object,
         )
         .await?;
 
@@ -2392,7 +2762,7 @@ impl DiskAPI for LocalDisk {
                     let part_path = format!("part.{}", part.number);
                     let part_path = path_join_buf(&[
                         path,
-                        fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
+                        fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
                         part_path.as_str(),
                     ]);
                     let part_path = self.get_object_path(volume, part_path.as_str())?;
@@ -2409,7 +2779,7 @@ impl DiskAPI for LocalDisk {
             if inline && fi.shard_file_size(fi.parts[0].actual_size) < DEFAULT_INLINE_BLOCK as i64 {
                 let part_path = path_join_buf(&[
                     path,
-                    fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
+                    fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
                     format!("part.{}", fi.parts[0].number).as_str(),
                 ]);
                 let part_path = self.get_object_path(volume, part_path.as_str())?;
@@ -2694,6 +3064,72 @@ mod test {
     }
 
     #[tokio::test]
+    async fn cleanup_tmp_on_startup_moves_existing_tmp_and_recreates_trash() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let leftover = tmp.join("leftover").join("data");
+        fs::create_dir_all(leftover.parent().unwrap()).await.unwrap();
+        fs::write(&leftover, b"temporary").await.unwrap();
+
+        LocalDisk::cleanup_tmp_on_startup(dir.path()).await.unwrap();
+
+        assert!(!tmp.join("leftover").exists());
+        assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_tmp_objects_moves_expired_tmp_dirs_to_trash() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let stale = tmp.join("stale").join("data");
+        let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+        fs::create_dir_all(stale.parent().unwrap()).await.unwrap();
+        fs::create_dir_all(&trash).await.unwrap();
+        fs::write(&stale, b"temporary").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(!tmp.join("stale").exists());
+        assert!(trash.exists());
+
+        let mut entries = fs::read_dir(&trash).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_tmp_objects_keeps_fresh_dirs_and_regular_files() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let fresh_dir = tmp.join("fresh").join("data");
+        let regular_file = tmp.join("note.txt");
+        let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+
+        fs::create_dir_all(fresh_dir.parent().unwrap()).await.unwrap();
+        fs::create_dir_all(&trash).await.unwrap();
+        fs::write(&fresh_dir, b"temporary").await.unwrap();
+        fs::write(&regular_file, b"keep").await.unwrap();
+
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        assert!(tmp.join("fresh").exists());
+        assert!(regular_file.exists());
+
+        let mut entries = fs::read_dir(&trash).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn test_scan_dir_includes_nested_object_dirs() {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
@@ -2741,6 +3177,60 @@ mod test {
         assert!(names.contains(&"foo/bar".to_string()));
         assert!(names.contains(&"foo/bar/xyzzy".to_string()));
         assert!(names.contains(&"quux/thud".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_deduplicates_explicit_dir_marker_recursion() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join("marker/file.txt")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("marker/subdir/file.txt")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}")))
+            .await
+            .unwrap();
+
+        fs::write(bucket_dir.join("marker/file.txt/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("marker/subdir/file.txt/xl.meta"), b"meta")
+            .await
+            .unwrap();
+        fs::write(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}/xl.meta")), b"meta")
+            .await
+            .unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "marker/".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.unwrap();
+        let names: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name)
+            .collect();
+
+        assert_eq!(names.iter().filter(|name| *name == "marker/subdir/file.txt").count(), 1);
+        assert_eq!(names.iter().filter(|name| *name == "marker/subdir/").count(), 1);
+        assert_eq!(names.iter().filter(|name| *name == "marker/file.txt").count(), 1);
     }
 
     #[tokio::test]
@@ -2926,6 +3416,40 @@ mod test {
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
+    #[tokio::test]
+    async fn test_read_file_stream_rejects_offset_length_overflow() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        disk.make_volume("test-volume").await.unwrap();
+        disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
+            .await
+            .unwrap();
+
+        let result = disk.read_file_stream("test-volume", "test-file.txt", usize::MAX, 1).await;
+        assert!(matches!(result, Err(DiskError::FileCorrupt)));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_zero_copy_rejects_offset_length_overflow() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        disk.make_volume("test-volume").await.unwrap();
+        disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
+            .await
+            .unwrap();
+
+        let result = disk.read_file_zero_copy("test-volume", "test-file.txt", usize::MAX, 1).await;
+        assert!(matches!(result, Err(DiskError::FileCorrupt)));
+    }
+
     #[test]
     fn test_is_valid_volname() {
         // Valid volume names (length >= 3)
@@ -3102,5 +3626,33 @@ mod test {
 
             assert_eq!(normalize_path_components("C:\\a\\..\\b"), PathBuf::from("C:\\b"));
         }
+    }
+
+    #[test]
+    fn should_reclaim_file_cache_after_write_respects_env_and_threshold() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, || {
+            assert!(!should_reclaim_file_cache_after_write(8 * 1024 * 1024));
+        });
+
+        temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, Some("true"), || {
+            temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
+                assert!(should_reclaim_file_cache_after_write(8 * 1024 * 1024));
+                assert!(!should_reclaim_file_cache_after_write(1024));
+            });
+        });
+    }
+
+    #[test]
+    fn should_reclaim_file_cache_after_read_respects_env_and_threshold() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, || {
+            assert!(!should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+        });
+
+        temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("true"), || {
+            temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
+                assert!(should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+                assert!(!should_reclaim_file_cache_after_read(1024));
+            });
+        });
     }
 }

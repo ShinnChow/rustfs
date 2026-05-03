@@ -17,6 +17,7 @@ use crate::auth::{check_key_valid, get_condition_values_with_query, get_session_
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
+use crate::storage::request_context::RequestContext;
 use metrics::counter;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::policy_sys::PolicySys;
@@ -34,7 +35,7 @@ use s3s::access::{S3Access, S3AccessContext};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use url::Url;
+use url::{Url, form_urlencoded};
 
 #[derive(Default, Clone, Debug)]
 pub(crate) struct ReqInfo {
@@ -45,6 +46,7 @@ pub(crate) struct ReqInfo {
     pub version_id: Option<String>,
     #[allow(dead_code)]
     pub region: Option<s3s::region::Region>,
+    pub request_context: Option<RequestContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +67,15 @@ pub(crate) fn req_info_mut<T>(req: &mut S3Request<T>) -> S3Result<&mut ReqInfo> 
 fn ext_req_info_mut(ext: &mut http::Extensions) -> S3Result<&mut ReqInfo> {
     ext.get_mut::<ReqInfo>()
         .ok_or_else(|| s3_error!(InternalError, "ReqInfo not found in request extensions"))
+}
+
+/// Extract the canonical `RequestContext` from a request, checking both
+/// the request extensions directly and the `ReqInfo.request_context` field.
+pub(crate) fn request_context_from_req<T>(req: &S3Request<T>) -> Option<RequestContext> {
+    req.extensions
+        .get::<RequestContext>()
+        .cloned()
+        .or_else(|| req.extensions.get::<ReqInfo>().and_then(|ri| ri.request_context.clone()))
 }
 
 #[derive(Clone, Debug)]
@@ -209,6 +220,30 @@ fn action_tag_metric_label(action: &Action) -> &'static str {
     }
 }
 
+fn merge_list_bucket_query_conditions(action: Action, query: Option<&str>, conditions: &mut HashMap<String, Vec<String>>) {
+    if !matches!(
+        action,
+        Action::S3Action(
+            S3Action::ListBucketAction | S3Action::ListBucketVersionsAction | S3Action::ListBucketMultipartUploadsAction
+        )
+    ) {
+        return;
+    }
+
+    let Some(query) = query else {
+        return;
+    };
+
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "prefix" | "delimiter" | "max-keys" => {
+                conditions.entry(key.into_owned()).or_default().push(value.into_owned());
+            }
+            _ => {}
+        }
+    }
+}
+
 fn auth_fs() -> &'static FS {
     static AUTH_FS: OnceLock<FS> = OnceLock::new();
     AUTH_FS.get_or_init(FS::new)
@@ -238,7 +273,7 @@ async fn get_or_fetch_object_tag_conditions<T>(
         return Ok(cached.values.clone());
     }
 
-    counter!("rustfs.object_tag_conditions.fetched", "op" => action_tag_metric_label(&action)).increment(1);
+    counter!("rustfs_object_tag_conditions_fetched_total", "op" => action_tag_metric_label(&action)).increment(1);
     let fetched = auth_fs()
         .get_object_tag_conditions_for_policy(bucket, object, version_id)
         .await?;
@@ -257,7 +292,7 @@ async fn maybe_merge_object_tag_conditions<T>(
     needs_tag: bool,
 ) -> S3Result<()> {
     if !needs_tag || bucket.is_empty() || object.is_empty() {
-        counter!("rustfs.object_tag_conditions.skipped", "op" => action_tag_metric_label(&action)).increment(1);
+        counter!("rustfs_object_tag_conditions_skipped_total", "op" => action_tag_metric_label(&action)).increment(1);
         return Ok(());
     }
 
@@ -301,6 +336,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
         let mut conditions =
             get_condition_values_with_query(&req.headers, cred, version_id.as_deref(), None, remote_addr, req.uri.query());
+        merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
 
         let action_args = Args {
             account: &cred.access_key,
@@ -515,6 +551,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             remote_addr,
             req.uri.query(),
         );
+        merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
 
         let no_groups: Option<Vec<String>> = None;
         let bucket_tag_hint = if !bucket.is_empty() && !object.is_empty() {
@@ -731,10 +768,13 @@ impl S3Access for FS {
             (None, false)
         };
 
+        let request_context = cx.extensions_mut().get::<RequestContext>().cloned();
+
         let req_info = ReqInfo {
             cred,
             is_owner,
             region: rustfs_ecstore::global::get_global_region(),
+            request_context,
             ..Default::default()
         };
 
@@ -1449,6 +1489,12 @@ impl S3Access for FS {
         authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
     }
 
+    async fn list_object_versions_m(&self, req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
+    }
+
     /// Checks whether the ListObjects request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
@@ -1463,6 +1509,13 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
+        let req_info = ext_req_info_mut(&mut req.extensions)?;
+        req_info.bucket = Some(req.input.bucket.clone());
+
+        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
+    }
+
+    async fn list_objects_v2m(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
@@ -1849,10 +1902,28 @@ impl S3Access for FS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{HeaderMap, Method, Uri};
+    use http::{Extensions, HeaderMap, Method, Uri};
     use rustfs_policy::policy::{BucketPolicy, bucket_policy_uses_existing_object_tag_conditions};
     use std::collections::HashMap;
     use time::OffsetDateTime;
+
+    fn build_request<T>(input: T, method: Method) -> S3Request<T> {
+        S3Request {
+            input,
+            method,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn ensure_req_info<T>(req: &mut S3Request<T>) {
+        req.extensions.insert(ReqInfo::default());
+    }
 
     #[test]
     fn get_bucket_policy_uses_get_bucket_policy_action() {
@@ -1955,6 +2026,46 @@ mod tests {
     /// Object tag conditions must use keys like ExistingObjectTag/<tag-key> so that
     /// bucket policy conditions (e.g. s3:ExistingObjectTag/security) are evaluated correctly.
     #[test]
+    fn test_merge_list_bucket_query_conditions_extracts_supported_keys() {
+        let mut conditions = HashMap::new();
+        merge_list_bucket_query_conditions(
+            Action::S3Action(S3Action::ListBucketAction),
+            Some("prefix=photos%2F2024%2F&delimiter=%2F&max-keys=10&encoding-type=url"),
+            &mut conditions,
+        );
+
+        assert_eq!(conditions.get("prefix"), Some(&vec!["photos/2024/".to_string()]));
+        assert_eq!(conditions.get("delimiter"), Some(&vec!["/".to_string()]));
+        assert_eq!(conditions.get("max-keys"), Some(&vec!["10".to_string()]));
+        assert!(!conditions.contains_key("encoding-type"));
+    }
+
+    #[test]
+    fn test_merge_list_bucket_query_conditions_preserves_empty_prefix_signal() {
+        let mut conditions = HashMap::new();
+        merge_list_bucket_query_conditions(
+            Action::S3Action(S3Action::ListBucketVersionsAction),
+            Some("prefix=&delimiter=%2F"),
+            &mut conditions,
+        );
+
+        assert_eq!(conditions.get("prefix"), Some(&vec![String::new()]));
+        assert_eq!(conditions.get("delimiter"), Some(&vec!["/".to_string()]));
+    }
+
+    #[test]
+    fn test_merge_list_bucket_query_conditions_ignores_non_list_actions() {
+        let mut conditions = HashMap::new();
+        merge_list_bucket_query_conditions(
+            Action::S3Action(S3Action::GetObjectAction),
+            Some("prefix=photos%2F2024%2F&delimiter=%2F&max-keys=10"),
+            &mut conditions,
+        );
+
+        assert!(conditions.is_empty());
+    }
+
+    #[test]
     fn test_object_tag_conditions_key_format() {
         let mut tags = HashMap::new();
         tags.insert("ExistingObjectTag/security".to_string(), vec!["public".to_string()]);
@@ -1972,6 +2083,7 @@ mod tests {
 
     /// When policy metadata cannot be loaded, tag-based check is conservative (returns true).
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_bucket_policy_needs_existing_object_tag_load_failure_is_conservative() {
         let conditions = HashMap::new();
         let hint = load_bucket_policy_existing_object_tag_hint(
@@ -2287,5 +2399,75 @@ mod tests {
         assert_eq!(req_info.bucket.as_deref(), Some("test-bucket"));
         assert_eq!(req_info.object.as_deref(), Some("test-key"));
         assert_eq!(req_info.version_id, None);
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_upload_rejects_unauthorized_request() {
+        let fs = FS::new();
+        let mut req = build_request(
+            AbortMultipartUploadInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .build()
+                .unwrap(),
+            Method::DELETE,
+        );
+        ensure_req_info(&mut req);
+
+        let err = fs
+            .abort_multipart_upload(&mut req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_rejects_unauthorized_request() {
+        let fs = FS::new();
+        let mut req = build_request(
+            CompleteMultipartUploadInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .upload_id("upload-id".to_string())
+                .multipart_upload(Some(CompletedMultipartUpload::default()))
+                .build()
+                .unwrap(),
+            Method::POST,
+        );
+        ensure_req_info(&mut req);
+
+        let err = fs
+            .complete_multipart_upload(&mut req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn upload_part_copy_rejects_unauthorized_request() {
+        let fs = FS::new();
+        let mut req = build_request(
+            UploadPartCopyInput::builder()
+                .bucket("dst-bucket".to_string())
+                .key("dst-object".to_string())
+                .upload_id("upload-id".to_string())
+                .part_number(1)
+                .copy_source(CopySource::Bucket {
+                    bucket: "src-bucket".into(),
+                    key: "src-object".into(),
+                    version_id: None,
+                })
+                .build()
+                .unwrap(),
+            Method::PUT,
+        );
+        ensure_req_info(&mut req);
+
+        let err = fs
+            .upload_part_copy(&mut req)
+            .await
+            .expect_err("missing credentials should reject access");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 }

@@ -52,7 +52,7 @@ use rmp_serde::Serializer;
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
+use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use rustfs_workers::workers::Workers;
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
@@ -986,25 +986,11 @@ impl PoolMeta {
 }
 
 pub fn path2_bucket_object(name: &str) -> (String, String) {
-    path2_bucket_object_with_base_path("", name)
+    path_to_bucket_object(name)
 }
 
 pub fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
-    // Trim the base path and leading slash
-    let trimmed_path = path
-        .strip_prefix(base_path)
-        .unwrap_or(path)
-        .strip_prefix(SLASH_SEPARATOR)
-        .unwrap_or(path);
-    // Find the position of the first '/'
-    let Some(pos) = trimmed_path.find(SLASH_SEPARATOR) else {
-        return (trimmed_path.to_string(), "".to_string());
-    };
-    // Split into bucket and prefix
-    let bucket = &trimmed_path[0..pos];
-    let prefix = &trimmed_path[pos + 1..]; // +1 to skip the '/' character if it exists
-
-    (bucket.to_string(), prefix.to_string())
+    path_to_bucket_object_with_base_path(base_path, path)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1405,7 +1391,8 @@ impl ECStore {
 
         let mut fivs = load_decommission_entry_versions(&entry, &bucket, "file_info_versions")?;
 
-        fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
+        fivs.versions
+            .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
@@ -3684,7 +3671,7 @@ mod pools_tests {
     #[test]
     fn test_take_decommission_canceler_takes_and_clears_slot() {
         let token = CancellationToken::new();
-        let mut cancelers = vec![Some(token.clone())];
+        let mut cancelers = vec![Some(token)];
 
         let taken = take_decommission_canceler(cancelers.as_mut_slice(), 0);
         assert!(taken.is_some());
@@ -3744,5 +3731,14 @@ mod pools_tests {
             err.to_string()
                 .contains("failed to start decommission routines: scheduled 1 of 2 expected workers")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_path2_bucket_object_with_base_path_supports_windows_separators() {
+        let (bucket, object) = super::path2_bucket_object_with_base_path("C:\\data", "C:\\data\\my-bucket\\nested\\object.txt");
+
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(object, "nested/object.txt");
     }
 }

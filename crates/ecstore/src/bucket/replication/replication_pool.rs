@@ -754,7 +754,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
         buckets: Vec<String>,
     ) -> Result<(), EcstoreError> {
         // Load bucket metadata system in background
-        let pool_clone = self.clone();
+        let pool_clone = self;
 
         tokio::spawn(async move {
             pool_clone.start_resync_routine(buckets, cancellation_token).await;
@@ -775,6 +775,14 @@ impl<S: StorageAPI> ReplicationPool<S> {
             .await
             .insert(bucket.to_string(), status.clone());
         Ok(status)
+    }
+
+    pub async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError> {
+        self.resyncer.cancel(&opts).await;
+        self.resyncer
+            .mark_status(ResyncStatusType::ResyncCanceled, opts, self.storage.clone())
+            .await?;
+        Ok(())
     }
 
     pub async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError> {
@@ -813,8 +821,11 @@ impl<S: StorageAPI> ReplicationPool<S> {
 
         let resyncer = self.resyncer.clone();
         let storage = self.storage.clone();
+        let cancel_token = CancellationToken::new();
+        resyncer.register_cancel_token(&opts, cancel_token.clone()).await;
         tokio::spawn(async move {
-            resyncer.resync_bucket(CancellationToken::new(), storage, false, opts).await;
+            Box::pin(resyncer.clone().resync_bucket(cancel_token, storage, false, opts.clone())).await;
+            resyncer.clear_cancel_token(&opts).await;
         });
 
         Ok(())
@@ -852,8 +863,12 @@ impl<S: StorageAPI> ReplicationPool<S> {
     }
 
     /// Load bucket replication resync statuses into memory
-    #[instrument(skip(cancellation_token))]
-    async fn load_resync(self: Arc<Self>, buckets: &[String], cancellation_token: CancellationToken) -> Result<(), EcstoreError> {
+    #[instrument(skip(_cancellation_token))]
+    async fn load_resync(
+        self: Arc<Self>,
+        buckets: &[String],
+        _cancellation_token: CancellationToken,
+    ) -> Result<(), EcstoreError> {
         // TODO: add leader_lock
         // Make sure only one node running resync on the cluster
         // Note: Leader lock implementation would be needed here
@@ -884,24 +899,20 @@ impl<S: StorageAPI> ReplicationPool<S> {
                         // Note: This would spawn a resync task in a real implementation
                         // For now, we just log the resync request
 
-                        let ctx = cancellation_token.clone();
+                        let ctx = CancellationToken::new();
                         let bucket_clone = bucket.clone();
                         let resync = self.resyncer.clone();
                         let storage = self.storage.clone();
+                        let opts = ResyncOpts {
+                            bucket: bucket_clone,
+                            arn,
+                            resync_id: stats.resync_id,
+                            resync_before: stats.resync_before_date,
+                        };
                         tokio::spawn(async move {
-                            resync
-                                .resync_bucket(
-                                    ctx,
-                                    storage,
-                                    true,
-                                    ResyncOpts {
-                                        bucket: bucket_clone,
-                                        arn,
-                                        resync_id: stats.resync_id,
-                                        resync_before: stats.resync_before_date,
-                                    },
-                                )
-                                .await;
+                            resync.register_cancel_token(&opts, ctx.clone()).await;
+                            Box::pin(resync.clone().resync_bucket(ctx, storage, true, opts.clone())).await;
+                            resync.clear_cancel_token(&opts).await;
                         });
                     }
                     _ => {}
@@ -945,10 +956,14 @@ pub type DynReplicationPool = dyn ReplicationPoolTrait + Send + Sync;
 /// Trait that abstracts the replication pool operations
 #[async_trait::async_trait]
 pub trait ReplicationPoolTrait: std::fmt::Debug {
+    fn active_workers(&self) -> i32;
+    fn active_mrf_workers(&self) -> i32;
+    fn active_lrg_workers(&self) -> i32;
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo);
     async fn queue_replica_delete_task(&self, ri: DeletedObjectReplicationInfo);
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
+    async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError>;
     async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError>;
     async fn init_resync(
         self: Arc<Self>,
@@ -960,6 +975,18 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
 // Implement the trait for ReplicationPool
 #[async_trait::async_trait]
 impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
+    fn active_workers(&self) -> i32 {
+        ReplicationPool::<S>::active_workers(self)
+    }
+
+    fn active_mrf_workers(&self) -> i32 {
+        ReplicationPool::<S>::active_mrf_workers(self)
+    }
+
+    fn active_lrg_workers(&self) -> i32 {
+        ReplicationPool::<S>::active_lrg_workers(self)
+    }
+
     async fn queue_replica_task(&self, ri: ReplicateObjectInfo) {
         self.queue_replica_task(ri).await;
     }
@@ -974,6 +1001,10 @@ impl<S: StorageAPI> ReplicationPoolTrait for ReplicationPool<S> {
 
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError> {
         self.get_bucket_resync_status(bucket).await
+    }
+
+    async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError> {
+        self.cancel_bucket_resync(opts).await
     }
 
     async fn start_bucket_resync(self: Arc<Self>, opts: ResyncOpts) -> Result<(), EcstoreError> {

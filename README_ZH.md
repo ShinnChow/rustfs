@@ -113,7 +113,7 @@ RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 
  docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
  # 使用指定版本运行
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.68
+ docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:v1.0.0-beta.1
 ```
 
 您也可以使用 Docker Compose。使用根目录下的 `docker-compose.yml` 文件：
@@ -122,7 +122,7 @@ RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 
 docker compose --profile observability up -d
 ```
 
-**注意**: 我们建议您在运行前查看 `docker-compose.yaml` 文件。该文件定义了包括 Grafana、Prometheus 和 Jaeger 在内的多个服务，有助于 RustFS 的可观测性监控。如果您还想启动 Redis 或 Nginx 容器，可以指定相应的 profile。
+**注意**: 我们建议您在运行前查看 `docker-compose.yml` 文件。该文件定义了包括 Grafana、Prometheus 和 Jaeger 在内的多个服务，有助于 RustFS 的可观测性监控。如果您还想启动 Redis 或 Nginx 容器，可以指定相应的 profile。
 
 ### 3\. 源码编译 (选项 3) - 进阶用户
 
@@ -163,11 +163,41 @@ make help-docker                      # 显示所有 Docker 相关命令
 
 请按照 [Helm Chart README](https://charts.rustfs.com) 上的说明在 Kubernetes 集群上安装 RustFS。
 
+### 5\. Nix Flake (Option 5)
+
+如果你已经 启用了 [Nix Flakes 功能](https://nixos.wiki/wiki/Flakes#Enable_flakes):
+
+```bash
+# 直接运行，无需安装
+nix run github:rustfs/rustfs
+
+# 编译二进制文件
+nix build github:rustfs/rustfs
+./result/bin/rustfs --help
+
+# 或者从本地检出的代码库运行/编译
+nix build
+nix run
+```
+
+### 6\. X-CMD (Option 6)
+
+如果你是 [x-cmd](https://www.x-cmd.com/install/rustfs) 用户：
+
+```bash
+# 直接运行，无需安装
+x rustfs
+
+# 下载二进制文件并安装到全局环境中
+x env use rustfs
+rustfs --help
+```
+
 ---
 
 ### 访问 RustFS
 
-1. **访问控制台**: 打开浏览器并访问 `http://localhost:9000` 进入 RustFS 控制台。
+1. **访问控制台**: 打开浏览器并访问 `http://localhost:9001` 进入 RustFS 控制台。
    - 默认账号/密码: `rustfsadmin` / `rustfsadmin`
 2. **创建存储桶**: 使用控制台为您​​的对象创建一个新的存储桶 (Bucket)。
 3. **上传对象**: 您可以直接通过控制台上传文件，或使用 S3 兼容的 API/客户端与您的 RustFS 实例进行交互。
@@ -198,7 +228,7 @@ make help-docker                      # 显示所有 Docker 相关命令
 - **商务合作**: [hello@rustfs.com](mailto:hello@rustfs.com)
 - **工作机会**: [jobs@rustfs.com](mailto:jobs@rustfs.com)
 - **一般讨论**: [GitHub Discussions](https://github.com/rustfs/rustfs/discussions)
-- **贡献指南**: [CONTRIBUTING.md](https://www.google.com/search?q=CONTRIBUTING.md)
+- **贡献指南**: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## 贡献者
 

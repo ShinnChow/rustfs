@@ -38,7 +38,6 @@ futures = { workspace = true }
 form_urlencoded = { workspace = true }
 hashbrown = { workspace = true }
 rayon = { workspace = true }
-rumqttc = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 starshard = { workspace = true }
@@ -59,8 +58,9 @@ quick-xml = { workspace = true, features = ["serialize", "serde-types", "encodin
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 axum = { workspace = true }
-rustfs-utils = { workspace = true, features = ["path", "sys"] }
+rustfs-utils = { workspace = true, features = ["path"] }
 serde_json = { workspace = true }
+time = { workspace = true }
 
 [lints]
 workspace = true
